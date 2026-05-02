@@ -74,7 +74,7 @@ For development only:
 ## 📦 Download
 
 👉 Get the latest version from **Releases**
-*(Upload your .exe there)*
+
 
 ---
 
