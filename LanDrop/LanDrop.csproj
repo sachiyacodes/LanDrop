@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
+    <AssemblyName>LanDrop</AssemblyName>
+    <RootNamespace>LanDrop</RootNamespace>
+    <Platforms>x64</Platforms>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+    <!-- App icon: shows on exe file, taskbar, and alt-tab -->
+    <ApplicationIcon>Resources\LanDrop.ico</ApplicationIcon>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Serilog"                        Version="3.1.1" />
+    <PackageReference Include="Serilog.Sinks.File"            Version="5.0.0" />
+    <PackageReference Include="Serilog.Extensions.Logging"    Version="8.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Logging"  Version="8.0.0" />
+    <PackageReference Include="CommunityToolkit.Mvvm"         Version="8.2.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Embed icon as a WPF resource so it also shows in the window title bar -->
+    <Resource Include="Resources\LanDrop.ico" />
+  </ItemGroup>
+
+</Project>
