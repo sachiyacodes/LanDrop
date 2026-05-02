@@ -34,7 +34,13 @@ LanDrop removes all of that.
 
 ## 📸 Demo
 
-> *(Add screenshots or a GIF here — this is important)*
+<img width="1224" height="851" alt="image" src="https://github.com/user-attachments/assets/8aa6d50b-d7a7-4d7c-ac74-22d2d90b654a" />
+<img width="1223" height="841" alt="image" src="https://github.com/user-attachments/assets/59b73f31-4688-4643-bbf3-6d38f59ac0f1" />
+<img width="1220" height="840" alt="image" src="https://github.com/user-attachments/assets/413b6b64-d34c-441d-904b-0f3309ad994b" />
+<img width="1217" height="850" alt="image" src="https://github.com/user-attachments/assets/e999a3ec-a911-465d-b2d4-96193a0a495a" />
+
+
+
 
 ---
 
