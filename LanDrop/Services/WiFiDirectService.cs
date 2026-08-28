@@ -42,7 +42,7 @@ namespace LanDrop.Services
 
             _settings.WifiDirectSsid = Ssid;
             _settings.WifiDirectPass = Password;
-            App.SettingsSvc.Save(_settings);
+            App.SettingsSvc?.Save(_settings);
 
             bool ok = await TryMobileHotspotAsync();
             if (!ok) ok = await TryNetshHotspotAsync();
@@ -82,6 +82,7 @@ namespace LanDrop.Services
 
         private async Task<bool> TryMobileHotspotAsync()
         {
+            string tmp = System.IO.Path.Combine(System.IO.Path.GetTempPath(), $"ld_start_{Guid.NewGuid():N}.ps1");
             try
             {
                 // Build PS script without C# string interpolation inside the PS body
@@ -92,25 +93,31 @@ namespace LanDrop.Services
                     "function Await($t,$r){ $n=$asTaskG.MakeGenericMethod($r); $k=$n.Invoke($null,@($t)); $k.Wait(-1)|Out-Null; $k.Result }\r\n" +
                     "function AwaitA($t){ $m=([System.WindowsRuntimeSystemExtensions].GetMethods()|Where-Object{$_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncAction'})[0]; $n=$m.Invoke($null,@($t)); $n.Wait(-1)|Out-Null }\r\n" +
                     "[Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager,Windows.Networking.NetworkOperators,ContentType=WindowsRuntime]|Out-Null\r\n" +
-                    "$cp=[Windows.Networking.Connectivity.NetworkInformation,Windows.Networking.Connectivity,ContentType=WindowsRuntime]::GetInternetConnectionProfile()\r\n" +
-                    "if($cp -eq $null){ $cp=[Windows.Networking.Connectivity.NetworkInformation,Windows.Networking.Connectivity,ContentType=WindowsRuntime]::GetConnectionProfiles()|Select-Object -First 1 }\r\n" +
-                    "if($cp -eq $null){ Write-Output 'FAILED:noprofile'; exit 1 }\r\n" +
-                    "$tm=[Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager,Windows.Networking.NetworkOperators,ContentType=WindowsRuntime]::CreateFromConnectionProfile($cp)\r\n" +
-                    "$cfg=$tm.GetCurrentAccessPointConfiguration()\r\n" +
-                    "$cfg.Ssid='__SSID__'\r\n" +
-                    "$cfg.Passphrase='__PASS__'\r\n" +
+                    "$tm = $null\r\n" +
+                    "$cp = [Windows.Networking.Connectivity.NetworkInformation,Windows.Networking.Connectivity,ContentType=WindowsRuntime]::GetInternetConnectionProfile()\r\n" +
+                    "if ($cp -ne $null) { try { $tm = [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager,Windows.Networking.NetworkOperators,ContentType=WindowsRuntime]::CreateFromConnectionProfile($cp) } catch {} }\r\n" +
+                    "if ($tm -eq $null) {\r\n" +
+                    "    $profiles = [Windows.Networking.Connectivity.NetworkInformation,Windows.Networking.Connectivity,ContentType=WindowsRuntime]::GetConnectionProfiles()\r\n" +
+                    "    if ($profiles -ne $null) {\r\n" +
+                    "        foreach ($p in $profiles) {\r\n" +
+                    "            try { $t = [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager,Windows.Networking.NetworkOperators,ContentType=WindowsRuntime]::CreateFromConnectionProfile($p); if ($t -ne $null) { $tm = $t; break } } catch {}\r\n" +
+                    "        }\r\n" +
+                    "    }\r\n" +
+                    "}\r\n" +
+                    "if ($tm -eq $null) { Write-Output 'FAILED:noprofile'; exit 1 }\r\n" +
+                    "$cfg = $tm.GetCurrentAccessPointConfiguration()\r\n" +
+                    "$cfg.Ssid = '__SSID__'\r\n" +
+                    "$cfg.Passphrase = '__PASS__'\r\n" +
                     "AwaitA($tm.ConfigureAccessPointAsync($cfg))\r\n" +
-                    "$res=Await($tm.StartTetheringAsync()) ([Windows.Networking.NetworkOperators.NetworkOperatorTetheringOperationResult])\r\n" +
-                    "if($res.Status -eq [Windows.Networking.NetworkOperators.TetheringOperationStatus]::Success){ Write-Output 'SUCCESS' }else{ Write-Output ('FAILED:'+$res.Status.ToString()) }\r\n";
+                    "$res = Await($tm.StartTetheringAsync()) ([Windows.Networking.NetworkOperators.NetworkOperatorTetheringOperationResult])\r\n" +
+                    "if ($res.Status -eq [Windows.Networking.NetworkOperators.TetheringOperationStatus]::Success) { Write-Output 'SUCCESS' } else { Write-Output ('FAILED:' + $res.Status.ToString()) }\r\n";
 
                 string ps = psTemplate
                     .Replace("__SSID__", Ssid.Replace("'", "''"))
                     .Replace("__PASS__", Password.Replace("'", "''"));
 
-                string tmp = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "ld_start.ps1");
                 await System.IO.File.WriteAllTextAsync(tmp, ps);
                 var r = await RunCmd("powershell", "-ExecutionPolicy Bypass -WindowStyle Hidden -File \"" + tmp + "\"");
-                System.IO.File.Delete(tmp);
 
                 _logger.LogInformation("MobileHotspot PS output: {Out}", r.Out);
                 return r.Out.Contains("SUCCESS");
@@ -120,12 +127,22 @@ namespace LanDrop.Services
                 _logger.LogWarning(ex, "MobileHotspot start failed");
                 return false;
             }
+            finally
+            {
+                try
+                {
+                    if (System.IO.File.Exists(tmp))
+                        System.IO.File.Delete(tmp);
+                }
+                catch { }
+            }
         }
 
         // ── Mobile Hotspot stop (WinRT via PowerShell) ────────────────────
 
         private async Task StopMobileHotspotAsync()
         {
+            string tmp = System.IO.Path.Combine(System.IO.Path.GetTempPath(), $"ld_stop_{Guid.NewGuid():N}.ps1");
             try
             {
                 string ps =
@@ -133,21 +150,36 @@ namespace LanDrop.Services
                     "$asTaskG = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]\r\n" +
                     "function Await($t,$r){ $n=$asTaskG.MakeGenericMethod($r); $k=$n.Invoke($null,@($t)); $k.Wait(-1)|Out-Null; $k.Result }\r\n" +
                     "[Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager,Windows.Networking.NetworkOperators,ContentType=WindowsRuntime]|Out-Null\r\n" +
-                    "$cp=[Windows.Networking.Connectivity.NetworkInformation,Windows.Networking.Connectivity,ContentType=WindowsRuntime]::GetInternetConnectionProfile()\r\n" +
-                    "if($cp -eq $null){ $cp=[Windows.Networking.Connectivity.NetworkInformation,Windows.Networking.Connectivity,ContentType=WindowsRuntime]::GetConnectionProfiles()|Select-Object -First 1 }\r\n" +
-                    "if($cp -eq $null){ Write-Output 'SKIPPED'; exit 0 }\r\n" +
-                    "$tm=[Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager,Windows.Networking.NetworkOperators,ContentType=WindowsRuntime]::CreateFromConnectionProfile($cp)\r\n" +
-                    "$res=Await($tm.StopTetheringAsync()) ([Windows.Networking.NetworkOperators.NetworkOperatorTetheringOperationResult])\r\n" +
-                    "Write-Output ('STOP:'+$res.Status.ToString())\r\n";
+                    "$tm = $null\r\n" +
+                    "$cp = [Windows.Networking.Connectivity.NetworkInformation,Windows.Networking.Connectivity,ContentType=WindowsRuntime]::GetInternetConnectionProfile()\r\n" +
+                    "if ($cp -ne $null) { try { $tm = [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager,Windows.Networking.NetworkOperators,ContentType=WindowsRuntime]::CreateFromConnectionProfile($cp) } catch {} }\r\n" +
+                    "if ($tm -eq $null) {\r\n" +
+                    "    $profiles = [Windows.Networking.Connectivity.NetworkInformation,Windows.Networking.Connectivity,ContentType=WindowsRuntime]::GetConnectionProfiles()\r\n" +
+                    "    if ($profiles -ne $null) {\r\n" +
+                    "        foreach ($p in $profiles) {\r\n" +
+                    "            try { $t = [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager,Windows.Networking.NetworkOperators,ContentType=WindowsRuntime]::CreateFromConnectionProfile($p); if ($t -ne $null) { $tm = $t; break } } catch {}\r\n" +
+                    "        }\r\n" +
+                    "    }\r\n" +
+                    "}\r\n" +
+                    "if ($tm -eq $null) { Write-Output 'SKIPPED'; exit 0 }\r\n" +
+                    "$res = Await($tm.StopTetheringAsync()) ([Windows.Networking.NetworkOperators.NetworkOperatorTetheringOperationResult])\r\n" +
+                    "Write-Output ('STOP:' + $res.Status.ToString())\r\n";
 
-                string tmp = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "ld_stop.ps1");
                 await System.IO.File.WriteAllTextAsync(tmp, ps);
                 await RunCmd("powershell", "-ExecutionPolicy Bypass -WindowStyle Hidden -File \"" + tmp + "\"");
-                System.IO.File.Delete(tmp);
             }
             catch (Exception ex)
             {
                 _logger.LogWarning(ex, "StopMobileHotspot failed (non-critical)");
+            }
+            finally
+            {
+                try
+                {
+                    if (System.IO.File.Exists(tmp))
+                        System.IO.File.Delete(tmp);
+                }
+                catch { }
             }
         }
 
@@ -162,10 +194,18 @@ namespace LanDrop.Services
 
         // ── Helpers ───────────────────────────────────────────────────────
 
-        public static async Task<bool> IsHostedNetworkSupportedAsync()
+        public static Task<bool> IsHostedNetworkSupportedAsync()
         {
-            var r = await RunCmd("netsh", "wlan show drivers");
-            return r.Out.Contains("Yes");
+            try
+            {
+                foreach (var nic in NetworkInterface.GetAllNetworkInterfaces())
+                {
+                    if (nic.NetworkInterfaceType == NetworkInterfaceType.Wireless80211)
+                        return Task.FromResult(true);
+                }
+            }
+            catch { }
+            return Task.FromResult(false);
         }
 
         private static string GetHotspotIp()

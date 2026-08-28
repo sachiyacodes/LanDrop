@@ -6,6 +6,6 @@ namespace LanDrop
     public partial class App
     {
         /// <summary>Application version string included in discovery beacons.</summary>
-        public const string Version = "1.0.0";
+        public const string Version = "2.0.0";
     }
 }

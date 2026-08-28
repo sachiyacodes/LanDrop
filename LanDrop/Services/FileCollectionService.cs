@@ -1,8 +1,10 @@
 // Services/FileCollectionService.cs
 // Builds a flat list of FileEntry objects from dropped files/folders
 
+using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Security;
 using LanDrop.Models;
 
 namespace LanDrop.Services
@@ -22,31 +24,92 @@ namespace LanDrop.Services
             var result = new List<FileEntry>();
             foreach (var path in paths)
             {
-                if (Directory.Exists(path))
-                    AddDirectory(path, Path.GetDirectoryName(path)!, result);
-                else if (File.Exists(path))
-                    result.Add(new FileEntry
+                if (string.IsNullOrWhiteSpace(path))
+                    continue;
+
+                try
+                {
+                    if (Directory.Exists(path))
                     {
-                        FullPath     = path,
-                        RelativePath = Path.GetFileName(path),
-                        SizeBytes    = new FileInfo(path).Length
-                    });
+                        var fullPath = Path.GetFullPath(path);
+                        var cleanDir = Path.TrimEndingDirectorySeparator(fullPath);
+                        var basePath = Path.GetDirectoryName(cleanDir) ?? cleanDir;
+                        AddDirectory(cleanDir, basePath, result);
+                    }
+                    else if (File.Exists(path))
+                    {
+                        try
+                        {
+                            var fileInfo = new FileInfo(path);
+                            result.Add(new FileEntry
+                            {
+                                FullPath     = path,
+                                RelativePath = Path.GetFileName(path),
+                                SizeBytes    = fileInfo.Length
+                            });
+                        }
+                        catch (Exception ex) when (ex is UnauthorizedAccessException or IOException or SecurityException)
+                        {
+                            // Skip inaccessible file
+                        }
+                    }
+                }
+                catch (Exception ex) when (ex is UnauthorizedAccessException or IOException or SecurityException)
+                {
+                    // Skip inaccessible path
+                }
             }
             return result;
         }
 
         private static void AddDirectory(string dir, string basePath, List<FileEntry> result)
         {
-            foreach (var file in Directory.EnumerateFiles(dir, "*", SearchOption.AllDirectories))
+            var stack = new Stack<string>();
+            stack.Push(dir);
+
+            while (stack.Count > 0)
             {
-                // relative path preserves folder hierarchy
-                var relative = Path.GetRelativePath(basePath, file);
-                result.Add(new FileEntry
+                var currentDir = stack.Pop();
+
+                // Enumerate subdirectories
+                try
                 {
-                    FullPath     = file,
-                    RelativePath = relative,
-                    SizeBytes    = new FileInfo(file).Length
-                });
+                    foreach (var subDir in Directory.EnumerateDirectories(currentDir))
+                    {
+                        stack.Push(subDir);
+                    }
+                }
+                catch (Exception ex) when (ex is UnauthorizedAccessException or IOException or SecurityException)
+                {
+                    // Skip inaccessible directory
+                }
+
+                // Enumerate files
+                try
+                {
+                    foreach (var file in Directory.EnumerateFiles(currentDir))
+                    {
+                        try
+                        {
+                            var fileInfo = new FileInfo(file);
+                            var relative = Path.GetRelativePath(basePath, file);
+                            result.Add(new FileEntry
+                            {
+                                FullPath     = file,
+                                RelativePath = relative,
+                                SizeBytes    = fileInfo.Length
+                            });
+                        }
+                        catch (Exception ex) when (ex is UnauthorizedAccessException or IOException or SecurityException)
+                        {
+                            // Skip inaccessible or locked file
+                        }
+                    }
+                }
+                catch (Exception ex) when (ex is UnauthorizedAccessException or IOException or SecurityException)
+                {
+                    // Skip inaccessible directory file enumeration
+                }
             }
         }
     }

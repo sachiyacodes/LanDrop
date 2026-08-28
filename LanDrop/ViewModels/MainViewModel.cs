@@ -37,6 +37,11 @@ namespace LanDrop.ViewModels
         private FileSender?              _sender;
         private CancellationTokenSource? _transferCts;
 
+        // Expose Settings & WifiDirectVM to XAML bindings
+        public AppSettings Settings => _settings;
+        public WiFiDirectViewModel WifiDirectVM => App.WifiDirectVM;
+        public void NotifySettingsChanged() => OnPropertyChanged(nameof(Settings));
+
         // ── Observable properties ─────────────────────────────────────────
         [ObservableProperty] private bool   _isDarkMode;
         [ObservableProperty] private string _localDeviceName = Environment.MachineName;
@@ -65,6 +70,36 @@ namespace LanDrop.ViewModels
 
         [ObservableProperty] private DeviceInfo? _selectedDevice;
         [ObservableProperty] private string       _manualIpInput   = string.Empty;
+
+        partial void OnSelectedDeviceChanged(DeviceInfo? value)
+        {
+            if (value != null)
+            {
+                ManualIpInput = value.Address.ToString();
+            }
+        }
+
+        partial void OnManualIpInputChanged(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                SelectedDevice = null;
+            }
+            else if (SelectedDevice != null && !SelectedDevice.Address.ToString().Equals(value.Trim(), StringComparison.OrdinalIgnoreCase))
+            {
+                var match = DiscoveredDevices.FirstOrDefault(d => d.Address.ToString().Equals(value.Trim(), StringComparison.OrdinalIgnoreCase));
+                SelectedDevice = match;
+            }
+            else if (SelectedDevice == null)
+            {
+                var match = DiscoveredDevices.FirstOrDefault(d => d.Address.ToString().Equals(value.Trim(), StringComparison.OrdinalIgnoreCase));
+                if (match != null)
+                {
+                    SelectedDevice = match;
+                }
+            }
+        }
+
         [ObservableProperty] private TransferState _transferState  = TransferState.Idle;
         [ObservableProperty] private double        _progressPercent = 0;
         [ObservableProperty] private long          _totalBytes      = 0;
@@ -94,24 +129,33 @@ namespace LanDrop.ViewModels
                 History.Add(h);
 
             _discovery.DeviceDiscovered += dev =>
-                Application.Current.Dispatcher.Invoke(() =>
+                Application.Current?.Dispatcher?.Invoke(() =>
                 {
                     if (!DiscoveredDevices.Any(x => x.Address.Equals(dev.Address)))
                         DiscoveredDevices.Add(dev);
                 });
 
             _discovery.DeviceLost += dev =>
-                Application.Current.Dispatcher.Invoke(() =>
+                Application.Current?.Dispatcher?.Invoke(() =>
                 {
                     var ex = DiscoveredDevices.FirstOrDefault(x => x.Address.Equals(dev.Address));
                     if (ex is not null) DiscoveredDevices.Remove(ex);
+                    if (SelectedDevice?.Address.Equals(dev.Address) == true)
+                        SelectedDevice = null;
                 });
 
             _receiver.IncomingTransfer  += OnIncomingTransfer;
             _receiver.Progress          += OnReceiverProgress;
             _receiver.TransferCompleted += OnTransferCompleted;
+            _receiver.SessionCompleted  += () =>
+                Application.Current?.Dispatcher?.Invoke(() =>
+                {
+                    TransferState   = TransferState.Completed;
+                    ProgressPercent = 100;
+                    StatusMessage   = "Received all files successfully";
+                });
             _receiver.TransferError     += msg =>
-                Application.Current.Dispatcher.Invoke(() =>
+                Application.Current?.Dispatcher?.Invoke(() =>
                 {
                     TransferState = TransferState.Failed;
                     StatusMessage = $"Transfer error: {msg}";
@@ -124,8 +168,20 @@ namespace LanDrop.ViewModels
         // ── Commands ──────────────────────────────────────────────────────
 
         [RelayCommand] private void ToggleTheme()  { IsDarkMode = !IsDarkMode; App.ApplyTheme(IsDarkMode); }
+        [RelayCommand] private void OpenSettings()
+        {
+            var win = new Views.SettingsWindow(_settings)
+            {
+                Owner = Application.Current?.MainWindow
+            };
+            if (win.ShowDialog() == true)
+            {
+                NotifySettingsChanged();
+            }
+        }
         [RelayCommand] private void SwitchToSend() => ActiveTab = 0;
         [RelayCommand] private void SwitchToReceive() => ActiveTab = 1;
+        [RelayCommand] private void SwitchTab(string index) { if (int.TryParse(index, out int i)) ActiveTab = i; }
         [RelayCommand] private void ClearHistory()
         {
             History.Clear();
@@ -142,9 +198,12 @@ namespace LanDrop.ViewModels
         [RelayCommand]
         private void AddFolder()
         {
-            using var dlg = new System.Windows.Forms.FolderBrowserDialog();
-            if (dlg.ShowDialog() == System.Windows.Forms.DialogResult.OK)
-                AddPaths(new[] { dlg.SelectedPath });
+            var dlg = new Microsoft.Win32.OpenFolderDialog
+            {
+                Title = "Select Folder to Send"
+            };
+            if (dlg.ShowDialog() == true && !string.IsNullOrWhiteSpace(dlg.FolderName))
+                AddPaths(new[] { dlg.FolderName });
         }
 
         [RelayCommand] private void RemoveFile(FileEntry e) => QueuedFiles.Remove(e);
@@ -153,6 +212,12 @@ namespace LanDrop.ViewModels
         [RelayCommand]
         private async Task SendFilesAsync()
         {
+            if (TransferState == TransferState.Transferring || TransferState == TransferState.Connecting)
+            {
+                ShowToast("Transfer In Progress", "A transfer is already in progress", "!", "warn");
+                return;
+            }
+
             if (QueuedFiles.Count == 0)
             {
                 ShowToast("No Files", "Add files or folders to send first", "!", "warn");
@@ -170,29 +235,11 @@ namespace LanDrop.ViewModels
             }
 
             var files = QueuedFiles.ToList();
-
-            // Hash phase
-            IsHashing    = true;
-            TransferState = TransferState.Connecting;
-            StatusMessage  = "Computing checksums…";
-
-            try
-            {
-                var svc = new FileHashService(_loggerFactory.CreateLogger<FileHashService>());
-                await svc.ComputeHashesAsync(files,
-                    (done, total) => HashingStatus = $"Hashing {done} of {total}…");
-            }
-            catch (Exception ex)
-            {
-                IsHashing = false; TransferState = TransferState.Failed;
-                ShowToast("Hash Error", ex.Message, "✕", "error");
-                return;
-            }
-            IsHashing = false;
+            _transferCts?.Dispose();
+            _transferCts = new CancellationTokenSource();
 
             // Transfer
-            _transferCts     = new CancellationTokenSource();
-            _sender          = new FileSender(_settings, _loggerFactory.CreateLogger<FileSender>());
+            _sender            = new FileSender(_settings, _loggerFactory.CreateLogger<FileSender>());
             _transferStartTime = DateTime.Now;
             _transferPeerName  = SelectedDevice?.DeviceName ?? targetIp;
 
@@ -205,7 +252,7 @@ namespace LanDrop.ViewModels
             try
             {
                 await _sender.SendAsync(targetIp, _settings.TransferPort, files, null,
-                    p => Application.Current.Dispatcher.Invoke(() =>
+                    p => Application.Current?.Dispatcher?.Invoke(() =>
                     {
                         TransferredBytes  = p.TransferredBytes;
                         TotalBytes        = p.TotalBytes;
@@ -224,11 +271,13 @@ namespace LanDrop.ViewModels
                 ProgressPercent = 100;
                 StatusMessage   = $"Sent {files.Count} file(s) successfully";
 
-                // Add to history
+                // Add to history (batch append)
                 double elapsed = (DateTime.Now - _transferStartTime).TotalSeconds;
                 double speed   = elapsed > 0 ? TotalBytes / elapsed / 1024.0 / 1024.0 : 0;
+                var historyBatch = new List<TransferHistoryEntry>();
                 foreach (var f in files)
-                    AddHistory(new TransferHistoryEntry
+                {
+                    var entry = new TransferHistoryEntry
                     {
                         FileName  = f.RelativePath,
                         SizeBytes = f.SizeBytes,
@@ -236,7 +285,12 @@ namespace LanDrop.ViewModels
                         Success   = true,
                         PeerName  = _transferPeerName,
                         SpeedMbps = speed
-                    });
+                    };
+                    historyBatch.Add(entry);
+                    History.Insert(0, entry);
+                    if (History.Count > 200) History.RemoveAt(History.Count - 1);
+                }
+                App.HistorySvc.AppendRange(historyBatch);
 
                 ShowToast("Transfer Complete",
                     $"Sent {files.Count} file(s) to {_transferPeerName}",
@@ -255,14 +309,22 @@ namespace LanDrop.ViewModels
                 ShowToast("Transfer Failed", ex.Message, "✕", "error");
                 _logger.LogError(ex, "Send error");
             }
-            finally { _transferCts?.Dispose(); _transferCts = null; }
+            finally
+            {
+                _sender = null;
+                _transferCts?.Dispose();
+                _transferCts = null;
+            }
         }
 
         [RelayCommand]
         private void PauseTransfer()
         {
             if (TransferState != TransferState.Transferring) return;
-            _sender?.Pause(); _receiver.Pause();
+            if (_sender != null)
+                _sender.Pause();
+            else
+                _receiver.Pause();
             TransferState = TransferState.Paused;
             StatusMessage  = "Paused";
         }
@@ -271,7 +333,10 @@ namespace LanDrop.ViewModels
         private void ResumeTransfer()
         {
             if (TransferState != TransferState.Paused) return;
-            _sender?.Resume(); _receiver.Resume();
+            if (_sender != null)
+                _sender.Resume();
+            else
+                _receiver.Resume();
             TransferState = TransferState.Transferring;
             StatusMessage  = "Resumed";
         }
@@ -281,7 +346,8 @@ namespace LanDrop.ViewModels
         {
             _transferCts?.Cancel();
             _sender?.Resume();
-            _receiver.Resume();
+            if (_sender == null)
+                _receiver.Resume();
             TransferState = TransferState.Cancelled;
             StatusMessage  = "Cancelled";
         }
@@ -302,14 +368,16 @@ namespace LanDrop.ViewModels
         [RelayCommand]
         private void ChangeSaveFolder()
         {
-            using var dlg = new System.Windows.Forms.FolderBrowserDialog
+            var dlg = new Microsoft.Win32.OpenFolderDialog
             {
-                SelectedPath = _settings.ReceiveSavePath
+                InitialDirectory = _settings.ReceiveSavePath,
+                Title            = "Select Save Folder"
             };
-            if (dlg.ShowDialog() != System.Windows.Forms.DialogResult.OK) return;
-            _settings.ReceiveSavePath = dlg.SelectedPath;
+            if (dlg.ShowDialog() != true || string.IsNullOrWhiteSpace(dlg.FolderName)) return;
+            _settings.ReceiveSavePath = dlg.FolderName;
             App.SettingsSvc.Save(_settings);
-            ShowToast("Save Folder Updated", dlg.SelectedPath, "✓", "success");
+            NotifySettingsChanged();
+            ShowToast("Save Folder Updated", dlg.FolderName, "✓", "success");
         }
 
         // ── Drag & drop ───────────────────────────────────────────────────
@@ -325,17 +393,38 @@ namespace LanDrop.ViewModels
                 Icon    = icon,
                 Type    = type
             };
-            Application.Current.Dispatcher.Invoke(() => Toasts.Add(toast));
+            var dispatcher = Application.Current?.Dispatcher;
+            if (dispatcher == null) return;
+            dispatcher.Invoke(() => Toasts.Add(toast));
             await Task.Delay(4000);
-            Application.Current.Dispatcher.Invoke(() => Toasts.Remove(toast));
+            dispatcher.Invoke(() => Toasts.Remove(toast));
         }
 
         // ── Receiver callbacks ────────────────────────────────────────────
         private void OnIncomingTransfer(object? s, IncomingTransferEventArgs args)
         {
-            Application.Current.Dispatcher.Invoke(() =>
+            Application.Current?.Dispatcher?.Invoke(() =>
             {
-                args.Accepted      = true;
+                if (_settings.AutoAccept)
+                {
+                    args.Accepted = true;
+                }
+                else
+                {
+                    var dlg = new Views.IncomingTransferDialog(args)
+                    {
+                        Owner = Application.Current?.MainWindow
+                    };
+                    dlg.ShowDialog();
+                    args.Accepted = dlg.Accepted;
+                }
+
+                if (!args.Accepted)
+                {
+                    StatusMessage = $"Rejected transfer from {args.Hello.SenderName}";
+                    return;
+                }
+
                 args.SaveDirectory = _settings.ReceiveSavePath;
 
                 TransferState    = TransferState.Transferring;
@@ -357,7 +446,7 @@ namespace LanDrop.ViewModels
 
         private void OnReceiverProgress(TransferProgress p)
         {
-            Application.Current.Dispatcher.Invoke(() =>
+            Application.Current?.Dispatcher?.Invoke(() =>
             {
                 TransferredBytes  = p.TransferredBytes;
                 TotalBytes        = p.TotalBytes;
@@ -371,9 +460,9 @@ namespace LanDrop.ViewModels
             });
         }
 
-        private void OnTransferCompleted(string path, bool ok)
+        private void OnTransferCompleted(string path, long sizeBytes, bool ok)
         {
-            Application.Current.Dispatcher.Invoke(() =>
+            Application.Current?.Dispatcher?.Invoke(() =>
             {
                 if (ok)
                 {
@@ -384,7 +473,7 @@ namespace LanDrop.ViewModels
                     AddHistory(new TransferHistoryEntry
                     {
                         FileName  = Path.GetFileName(path),
-                        SizeBytes = TotalBytes,
+                        SizeBytes = sizeBytes > 0 ? sizeBytes : TotalBytes,
                         IsSent    = false,
                         Success   = true,
                         PeerName  = _transferPeerName,
@@ -394,8 +483,6 @@ namespace LanDrop.ViewModels
                     ShowToast("File Received",
                         $"{Path.GetFileName(path)} from {_transferPeerName}",
                         "↓", "success");
-
-                    TransferState = TransferState.Completed;
                 }
                 else
                 {

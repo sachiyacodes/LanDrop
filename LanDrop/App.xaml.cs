@@ -36,6 +36,20 @@ namespace LanDrop
                 .CreateLogger();
             LoggerFactory = new LoggerFactory().AddSerilog(Log.Logger);
 
+            DispatcherUnhandledException += (s, args) =>
+            {
+                Log.Error(args.Exception, "Unhandled UI exception");
+                args.Handled = true;
+                MessageBox.Show($"An unexpected error occurred: {args.Exception.Message}", "LanDrop Error",
+                    MessageBoxButton.OK, MessageBoxImage.Error);
+            };
+
+            AppDomain.CurrentDomain.UnhandledException += (s, args) =>
+            {
+                if (args.ExceptionObject is Exception ex)
+                    Log.Fatal(ex, "Unhandled AppDomain exception");
+            };
+
             // Settings
             SettingsSvc = new SettingsService(LoggerFactory.CreateLogger<SettingsService>());
             Settings    = SettingsSvc.Load();
@@ -77,6 +91,14 @@ namespace LanDrop
             };
             Current.Resources.MergedDictionaries.Clear();
             Current.Resources.MergedDictionaries.Add(dict);
+
+            if (Current != null)
+            {
+                foreach (Window window in Current.Windows)
+                {
+                    Helpers.WindowHelper.ApplyTitleBarColor(window, dark);
+                }
+            }
         }
     }
 }

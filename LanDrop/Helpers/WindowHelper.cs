@@ -40,16 +40,21 @@ namespace LanDrop.Helpers
                 // Set caption (title bar) background color
                 // Color is COLORREF = 0x00BBGGRR
                 Color bg = darkMode
-                    ? Color.FromRgb(0x04, 0x06, 0x06)   // #040606
-                    : Color.FromRgb(0xFF, 0xFF, 0xFF);   // #ffffff
+                    ? Color.FromRgb(0x09, 0x0D, 0x11)   // #090D11 (Dark Theme TitleBarBrush)
+                    : Color.FromRgb(0xF8, 0xFA, 0xFC);   // #F8FAFC (Light Theme TitleBarBrush)
 
                 int colorRef = bg.R | (bg.G << 8) | (bg.B << 16);
                 DwmSetWindowAttribute(hwnd, DWMWA_CAPTION_COLOR,
                     ref colorRef, sizeof(int));
 
                 // Also match the border color
+                Color border = darkMode
+                    ? Color.FromRgb(0x1E, 0x29, 0x3B)   // #1E293B
+                    : Color.FromRgb(0xE2, 0xE8, 0xF0);   // #E2E8F0
+
+                int borderColorRef = border.R | (border.G << 8) | (border.B << 16);
                 DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR,
-                    ref colorRef, sizeof(int));
+                    ref borderColorRef, sizeof(int));
             }
             catch
             {

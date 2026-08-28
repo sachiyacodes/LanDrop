@@ -34,8 +34,9 @@ namespace LanDrop.Networking
         private readonly ILogger     _logger;
 
         // Pause/resume gate
+        private readonly object _pauseLock = new();
+        private TaskCompletionSource<bool>? _pauseTcs;
         private volatile bool _paused;
-        private readonly SemaphoreSlim _pauseGate = new(1, 1);
 
         public FileSender(AppSettings settings, ILogger<FileSender> logger)
         {
@@ -60,113 +61,237 @@ namespace LanDrop.Networking
         {
             _logger.LogInformation("Connecting to {Host}:{Port} to send {N} file(s).", host, port, files.Count);
 
-            using var tcp    = new TcpClient();
-            tcp.SendBufferSize    = _settings.SocketBufferSize;
-            tcp.ReceiveBufferSize = _settings.SocketBufferSize;
+            foreach (var f in files)
+            {
+                f.TransferredBytes = 0;
+            }
+
+            Resume();
+
+            using var tcp = new TcpClient();
+            tcp.SendBufferSize    = Math.Max(_settings.SocketBufferSize, 8 * 1024 * 1024);
+            tcp.ReceiveBufferSize = Math.Max(_settings.SocketBufferSize, 8 * 1024 * 1024);
             tcp.NoDelay = true;
 
             await tcp.ConnectAsync(host, port, ct);
             using var stream = tcp.GetStream();
 
-            // ── Handshake ────────────────────────────────────────────────────
-            await HandshakeAsync(stream, files, pin, ct);
-
-            // ── Send files ───────────────────────────────────────────────────
-            long totalBytes     = 0;
-            foreach (var f in files) totalBytes += f.SizeBytes;
-
-            long   sent          = 0;
-            var    speedWindow   = new Speedometer();
-            int    chunkSize     = _settings.ChunkSize;
-            byte[] buffer        = new byte[chunkSize];
-
-            for (int i = 0; i < files.Count; i++)
+            try
             {
-                var entry = files[i];
-                _logger.LogInformation("Sending file {Index}/{Total}: {Name}", i + 1, files.Count, entry.RelativePath);
+                // ── Handshake ────────────────────────────────────────────────────
+                await HandshakeAsync(stream, files, pin, ct);
 
-                // Send header
-                var header = new FileHeaderMsg(i, entry.RelativePath, entry.SizeBytes, entry.Sha256Hash!);
-                await stream.WriteJsonFrameAsync(MsgType.FileHeader, header, ct);
+                // ── Send files ───────────────────────────────────────────────────
+                long totalBytes     = 0;
+                foreach (var f in files) totalBytes += f.SizeBytes;
 
-                // Stream chunks
-                using var fs = new FileStream(entry.FullPath, FileMode.Open, FileAccess.Read,
-                                              FileShare.Read, chunkSize, useAsync: true);
+                long   sent          = 0;
+                var    speedWindow   = new Speedometer();
+                int    chunkSize     = Math.Max(_settings.ChunkSize, 4 * 1024 * 1024);
+                byte[] buffer        = System.Buffers.ArrayPool<byte>.Shared.Rent(chunkSize);
 
-                int read;
-                while ((read = await fs.ReadAsync(buffer, 0, buffer.Length, ct)) > 0)
+                using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                var ackToken = linkedCts.Token;
+
+                // Start asynchronous background ACK processor for pipelined streaming
+                var ackTask = Task.Run(async () =>
                 {
-                    // Pause gate
-                    if (_paused)
+                    try
                     {
-                        _logger.LogInformation("Transfer paused.");
-                        await _pauseGate.WaitAsync(ct);
-                        _pauseGate.Release();
-                        _logger.LogInformation("Transfer resumed.");
+                        for (int i = 0; i < files.Count; i++)
+                        {
+                            var (msgType, payload) = await stream.ReadFrameAsync(ackToken);
+                            if (msgType == MsgType.ChecksumAck)
+                            {
+                                var ack = FrameHelper.FromJson<ChecksumAckMsg>(payload);
+                                if (!ack.HashMatch)
+                                {
+                                    _logger.LogError("Checksum MISMATCH on file {Index}!", i);
+                                    throw new InvalidDataException($"Checksum mismatch for file {i}.");
+                                }
+                            }
+                            else if (msgType == MsgType.Error)
+                            {
+                                var err = FrameHelper.FromJson<ErrorMsg>(payload);
+                                throw new IOException($"Receiver error: {err.Message}");
+                            }
+                            else if (msgType == MsgType.Cancel)
+                            {
+                                throw new OperationCanceledException("Receiver cancelled the transfer.");
+                            }
+                        }
+                    }
+                    catch (Exception)
+                    {
+                        try { linkedCts.Cancel(); } catch { }
+                        throw;
+                    }
+                }, ackToken);
+
+                try
+                {
+                    var hasher = new FastHasher();
+
+                    for (int i = 0; i < files.Count; i++)
+                    {
+                        var entry = files[i];
+                        _logger.LogInformation("Streaming file {Index}/{Total}: {Name}", i + 1, files.Count, entry.RelativePath);
+
+                        // Send header
+                        var header = new FileHeaderMsg(i, entry.RelativePath, entry.SizeBytes);
+                        await stream.WriteJsonFrameAsync(MsgType.FileHeader, header, ackToken);
+
+                        hasher.Reset();
+
+                        if (entry.SizeBytes > 0)
+                        {
+                            bool isPrecompressed = FastCompress.IsPrecompressedExtension(entry.RelativePath);
+                            byte[]? compBuffer = !isPrecompressed ? System.Buffers.ArrayPool<byte>.Shared.Rent(chunkSize) : null;
+
+                            try
+                            {
+                                // SequentialScan kernel cache hint for maximum NVMe/SSD read-ahead throughput
+                                var fsOptions = new FileStreamOptions
+                                {
+                                    Mode = FileMode.Open,
+                                    Access = FileAccess.Read,
+                                    Share = FileShare.Read,
+                                    Options = FileOptions.SequentialScan | FileOptions.Asynchronous,
+                                    BufferSize = chunkSize
+                                };
+
+                                using (var fs = new FileStream(entry.FullPath, fsOptions))
+                                {
+                                    int read;
+                                    while ((read = await fs.ReadAsync(buffer.AsMemory(0, chunkSize), ackToken)) > 0)
+                                    {
+                                        // Pause gate
+                                        await WaitIfPausedAsync(ackToken);
+
+                                        ackToken.ThrowIfCancellationRequested();
+
+                                        // Compute hash on uncompressed source bytes
+                                        hasher.Append(buffer.AsSpan(0, read));
+
+                                        // Try real-time LZ4 compression if file is compressible
+                                        int compLen = -1;
+                                        if (compBuffer != null && read >= 128)
+                                        {
+                                            compLen = FastCompress.TryCompress(buffer.AsSpan(0, read), compBuffer.AsSpan(0, compBuffer.Length));
+                                        }
+
+                                        if (compLen > 0)
+                                        {
+                                            // Send compressed chunk (saves network bandwidth)
+                                            await stream.WriteCompressedChunkFrameAsync(compBuffer!, 0, compLen, read, ackToken);
+                                        }
+                                        else
+                                        {
+                                            // Send raw chunk directly
+                                            await stream.WriteChunkFrameAsync(MsgType.DataChunk, buffer, 0, read, ackToken);
+                                        }
+
+                                        sent += read;
+                                        entry.TransferredBytes += read;
+                                        speedWindow.Add(read);
+
+                                        onProgress(new TransferProgress(
+                                            totalBytes, sent,
+                                            speedWindow.BytesPerSecond,
+                                            i, entry.RelativePath));
+                                    }
+                                }
+                            }
+                            finally
+                            {
+                                if (compBuffer != null)
+                                {
+                                    System.Buffers.ArrayPool<byte>.Shared.Return(compBuffer);
+                                }
+                            }
+                        }
+
+                        // Compute final streaming hash on-the-fly
+                        string checksum = hasher.GetHashHex();
+                        entry.Sha256Hash = checksum;
+
+                        // Signal end of this file with computed checksum
+                        await stream.WriteJsonFrameAsync(MsgType.FileDone, new FileDoneMsg(i, entry.SizeBytes, checksum), ackToken);
                     }
 
-                    ct.ThrowIfCancellationRequested();
+                    // Await all pipelined ACKs to complete
+                    await ackTask;
 
-                    await stream.WriteFrameAsync(MsgType.DataChunk,
-                        read == buffer.Length ? buffer : buffer[..read], ct);
+                    // All files done
+                    await stream.WriteJsonFrameAsync(MsgType.SessionDone,
+                        new { SessionId = Guid.NewGuid().ToString() }, ct);
 
-                    sent += read;
-                    entry.TransferredBytes += read;
-                    speedWindow.Add(read);
-
-                    onProgress(new TransferProgress(
-                        totalBytes, sent,
-                        speedWindow.BytesPerSecond,
-                        i, entry.RelativePath));
+                    _logger.LogInformation("All files streamed successfully.");
                 }
-
-                // Signal end of this file
-                await stream.WriteJsonFrameAsync(MsgType.FileDone, new FileDoneMsg(i), ct);
-
-                // Wait for checksum ack
-                var (msgType, payload) = await stream.ReadFrameAsync(ct);
-                if (msgType == MsgType.ChecksumAck)
+                finally
                 {
-                    var ack = FrameHelper.FromJson<ChecksumAckMsg>(payload);
-                    if (!ack.HashMatch)
-                    {
-                        _logger.LogError("Checksum MISMATCH on file {Index}! Expected {Expected}, got {Actual}.",
-                            i, entry.Sha256Hash, ack.ActualHash);
-                        throw new InvalidDataException($"Checksum mismatch for '{entry.RelativePath}'.");
-                    }
-                    _logger.LogInformation("Checksum OK for {Name}.", entry.RelativePath);
-                }
-                else if (msgType == MsgType.Error)
-                {
-                    var err = FrameHelper.FromJson<ErrorMsg>(payload);
-                    throw new IOException($"Receiver error: {err.Message}");
+                    System.Buffers.ArrayPool<byte>.Shared.Return(buffer);
                 }
             }
-
-            // All files done
-            await stream.WriteJsonFrameAsync(MsgType.SessionDone,
-                new { SessionId = Guid.NewGuid().ToString() }, ct);
-
-            _logger.LogInformation("All files sent successfully.");
+            catch (OperationCanceledException)
+            {
+                _logger.LogInformation("Transfer cancelled by user.");
+                try
+                {
+                    using var cancelCts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+                    await stream.WriteFrameAsync(MsgType.Cancel, Array.Empty<byte>(), cancelCts.Token);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "Failed to send Cancel frame to receiver.");
+                }
+                throw;
+            }
         }
 
         // ── Pause / Resume / Cancel ───────────────────────────────────────────
 
         public void Pause()
         {
-            if (!_paused)
+            lock (_pauseLock)
             {
-                _paused = true;
-                _pauseGate.Wait(); // acquire – blocks the transfer loop
+                if (!_paused)
+                {
+                    _paused = true;
+                    _pauseTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                }
             }
         }
 
         public void Resume()
         {
-            if (_paused)
+            lock (_pauseLock)
             {
-                _paused = false;
-                _pauseGate.Release(); // unblocks the transfer loop
+                if (_paused)
+                {
+                    _paused = false;
+                    _pauseTcs?.TrySetResult(true);
+                    _pauseTcs = null;
+                }
+            }
+        }
+
+        private async Task WaitIfPausedAsync(CancellationToken ct)
+        {
+            Task? waitTask = null;
+            lock (_pauseLock)
+            {
+                if (_paused && _pauseTcs != null)
+                {
+                    waitTask = _pauseTcs.Task;
+                }
+            }
+
+            if (waitTask != null)
+            {
+                _logger.LogInformation("Transfer paused.");
+                await waitTask.WaitAsync(ct);
+                _logger.LogInformation("Transfer resumed.");
             }
         }
 
@@ -216,13 +341,19 @@ namespace LanDrop.Networking
 
     internal class Speedometer
     {
-        private readonly System.Collections.Generic.Queue<(DateTime time, long bytes)> _samples = new();
+        private readonly Queue<(DateTime time, long bytes)> _samples = new();
         private const double WindowSeconds = 2.0;
 
         public void Add(long bytes)
         {
-            _samples.Enqueue((DateTime.UtcNow, bytes));
-            var cutoff = DateTime.UtcNow.AddSeconds(-WindowSeconds);
+            var now = DateTime.UtcNow;
+            _samples.Enqueue((now, bytes));
+            Prune(now);
+        }
+
+        private void Prune(DateTime now)
+        {
+            var cutoff = now.AddSeconds(-WindowSeconds);
             while (_samples.Count > 0 && _samples.Peek().time < cutoff)
                 _samples.Dequeue();
         }
@@ -231,10 +362,23 @@ namespace LanDrop.Networking
         {
             get
             {
+                var now = DateTime.UtcNow;
+                Prune(now);
                 if (_samples.Count < 2) return 0;
+
                 long total = 0;
-                foreach (var s in _samples) total += s.bytes;
-                return total / WindowSeconds;
+                DateTime oldest = DateTime.MaxValue;
+
+                foreach (var s in _samples)
+                {
+                    total += s.bytes;
+                    if (s.time < oldest) oldest = s.time;
+                }
+
+                double elapsed = (now - oldest).TotalSeconds;
+                if (elapsed <= 0.0001) return 0;
+
+                return total / elapsed;
             }
         }
     }

@@ -1,0 +1,223 @@
+<Window x:Class="LanDrop.Views.SettingsWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Settings — LanDrop"
+        Width="520" Height="490"
+        MinWidth="500" MinHeight="470"
+        ResizeMode="NoResize"
+        WindowStartupLocation="CenterOwner"
+        Background="{DynamicResource BackgroundBrush}"
+        Icon="/Resources/LanDrop.ico">
+
+    <Window.Resources>
+        <!-- ══ FLAT TEXTBOX ══ -->
+        <Style x:Key="SettingsBox" TargetType="TextBox">
+            <Setter Property="Background"      Value="{DynamicResource InputBgBrush}"/>
+            <Setter Property="Foreground"      Value="{DynamicResource TextPrimaryBrush}"/>
+            <Setter Property="FontFamily"      Value="{DynamicResource MonoFont}"/>
+            <Setter Property="FontSize"        Value="12"/>
+            <Setter Property="BorderBrush"     Value="{DynamicResource BorderBrush}"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="Padding"         Value="10,8"/>
+            <Setter Property="CaretBrush"      Value="{DynamicResource PrimaryBrush}"/>
+            <Setter Property="SelectionBrush"  Value="{DynamicResource PrimaryBrush}"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="TextBox">
+                        <Border x:Name="Bd" Background="{TemplateBinding Background}"
+                                BorderBrush="{TemplateBinding BorderBrush}"
+                                BorderThickness="{TemplateBinding BorderThickness}"
+                                CornerRadius="8">
+                            <ScrollViewer x:Name="PART_ContentHost"
+                                          Margin="{TemplateBinding Padding}"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsFocused" Value="True">
+                                <Setter TargetName="Bd" Property="BorderBrush"
+                                        Value="{DynamicResource PrimaryBrush}"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- ══ PRIMARY BUTTON ══ -->
+        <Style x:Key="SettingsPrimaryBtn" TargetType="Button">
+            <Setter Property="Background"      Value="{DynamicResource PrimaryBrush}"/>
+            <Setter Property="Foreground"      Value="#090D11"/>
+            <Setter Property="FontFamily"      Value="{DynamicResource BodyFont}"/>
+            <Setter Property="FontSize"        Value="13"/>
+            <Setter Property="FontWeight"      Value="SemiBold"/>
+            <Setter Property="Padding"         Value="20,8"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Cursor"          Value="Hand"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="Root" Background="{TemplateBinding Background}"
+                                CornerRadius="8" Padding="{TemplateBinding Padding}">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="Root" Property="Background"
+                                        Value="{DynamicResource PrimaryHoverBrush}"/>
+                            </Trigger>
+                            <Trigger Property="IsPressed" Value="True">
+                                <Setter Property="Opacity" Value="0.88"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- ══ GHOST BUTTON ══ -->
+        <Style x:Key="SettingsGhostBtn" TargetType="Button">
+            <Setter Property="Background"      Value="{DynamicResource SurfaceAltBrush}"/>
+            <Setter Property="Foreground"      Value="{DynamicResource TextPrimaryBrush}"/>
+            <Setter Property="FontFamily"      Value="{DynamicResource BodyFont}"/>
+            <Setter Property="FontSize"        Value="12"/>
+            <Setter Property="FontWeight"      Value="Medium"/>
+            <Setter Property="Padding"         Value="14,7"/>
+            <Setter Property="BorderBrush"     Value="{DynamicResource BorderBrush}"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="Cursor"          Value="Hand"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="Root" Background="{TemplateBinding Background}"
+                                BorderBrush="{TemplateBinding BorderBrush}"
+                                BorderThickness="{TemplateBinding BorderThickness}"
+                                CornerRadius="8" Padding="{TemplateBinding Padding}">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="Root" Property="Background"
+                                        Value="{DynamicResource SurfaceHoverBrush}"/>
+                                <Setter TargetName="Root" Property="BorderBrush"
+                                        Value="{DynamicResource BorderHoverBrush}"/>
+                            </Trigger>
+                            <Trigger Property="IsPressed" Value="True">
+                                <Setter Property="Opacity" Value="0.8"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- ══ CARD ══ -->
+        <Style x:Key="SettingsCard" TargetType="Border">
+            <Setter Property="Background"      Value="{DynamicResource SurfaceBrush}"/>
+            <Setter Property="BorderBrush"     Value="{DynamicResource BorderBrush}"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="CornerRadius"    Value="12"/>
+            <Setter Property="Padding"         Value="16,12"/>
+            <Setter Property="Margin"          Value="0,0,0,10"/>
+        </Style>
+    </Window.Resources>
+
+    <Grid Margin="22,18,22,18">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>  <!-- Title -->
+            <RowDefinition Height="*"/>     <!-- Cards Content -->
+            <RowDefinition Height="Auto"/>  <!-- Footer -->
+        </Grid.RowDefinitions>
+
+        <!-- Title -->
+        <TextBlock Grid.Row="0" Text="Settings"
+                   FontFamily="{DynamicResource DisplayFont}"
+                   FontSize="18" FontWeight="Bold"
+                   Foreground="{DynamicResource TextPrimaryBrush}"
+                   Margin="2,0,0,16"/>
+
+        <!-- Content Cards -->
+        <StackPanel Grid.Row="1">
+            <!-- Network Ports Card -->
+            <Border Style="{StaticResource SettingsCard}">
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="14"/>
+                        <ColumnDefinition Width="*"/>
+                    </Grid.ColumnDefinitions>
+
+                    <StackPanel Grid.Column="0">
+                        <TextBlock Text="TRANSFER PORT"
+                                   FontFamily="{DynamicResource BodyFont}"
+                                   FontSize="10" FontWeight="Bold"
+                                   Foreground="{DynamicResource TextMutedBrush}"
+                                   Margin="2,0,0,6"/>
+                        <TextBox x:Name="TransferPortBox" Style="{StaticResource SettingsBox}"/>
+                    </StackPanel>
+
+                    <StackPanel Grid.Column="2">
+                        <TextBlock Text="DISCOVERY PORT"
+                                   FontFamily="{DynamicResource BodyFont}"
+                                   FontSize="10" FontWeight="Bold"
+                                   Foreground="{DynamicResource TextMutedBrush}"
+                                   Margin="2,0,0,6"/>
+                        <TextBox x:Name="DiscoveryPortBox" Style="{StaticResource SettingsBox}"/>
+                    </StackPanel>
+                </Grid>
+            </Border>
+
+            <!-- Save Path Card -->
+            <Border Style="{StaticResource SettingsCard}">
+                <StackPanel>
+                    <TextBlock Text="DEFAULT SAVE LOCATION"
+                               FontFamily="{DynamicResource BodyFont}"
+                               FontSize="10" FontWeight="Bold"
+                               Foreground="{DynamicResource TextMutedBrush}"
+                               Margin="2,0,0,6"/>
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
+                        </Grid.ColumnDefinitions>
+                        <TextBox x:Name="SavePathBox" Grid.Column="0"
+                                 Style="{StaticResource SettingsBox}"/>
+                        <Button Grid.Column="1" Style="{StaticResource SettingsGhostBtn}"
+                                Content="Browse…" Click="Browse_Click"
+                                Margin="8,0,0,0" Padding="14,0"/>
+                    </Grid>
+                </StackPanel>
+            </Border>
+
+            <!-- Transfers Preferences Card -->
+            <Border Style="{StaticResource SettingsCard}">
+                <StackPanel>
+                    <TextBlock Text="TRANSFERS"
+                               FontFamily="{DynamicResource BodyFont}"
+                               FontSize="10" FontWeight="Bold"
+                               Foreground="{DynamicResource TextMutedBrush}"
+                               Margin="2,0,0,8"/>
+                    <CheckBox x:Name="AutoAcceptBox"
+                              Content="Automatically accept incoming transfers without prompt"
+                              FontFamily="{DynamicResource BodyFont}"
+                              FontSize="12"
+                              Foreground="{DynamicResource TextPrimaryBrush}"
+                              VerticalAlignment="Center"/>
+                </StackPanel>
+            </Border>
+        </StackPanel>
+
+        <!-- Footer Buttons -->
+        <DockPanel Grid.Row="2" LastChildFill="False" Margin="0,14,0,0">
+            <Button DockPanel.Dock="Right"
+                    Style="{StaticResource SettingsPrimaryBtn}"
+                    Content="Save Changes"
+                    Click="Save_Click"
+                    IsDefault="True"
+                    Margin="8,0,0,0"/>
+            <Button DockPanel.Dock="Right"
+                    Style="{StaticResource SettingsGhostBtn}"
+                    Content="Cancel"
+                    Click="Cancel_Click"
+                    IsCancel="True"/>
+        </DockPanel>
+    </Grid>
+</Window>

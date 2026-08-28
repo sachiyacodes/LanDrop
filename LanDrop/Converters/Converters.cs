@@ -5,6 +5,7 @@ using System;
 using System.Globalization;
 using System.Windows;
 using System.Windows.Data;
+using System.Windows.Media;
 using LanDrop.Helpers;
 using LanDrop.Models;
 
@@ -73,22 +74,35 @@ namespace LanDrop.Converters
             v is Visibility vis && vis != Visibility.Visible;
     }
 
-    /// <summary>Converts TransferState to a colour-coded status string.</summary>
+    /// <summary>Converts TransferState to a colour-coded Brush.</summary>
     public class TransferStateToColorConverter : IValueConverter
     {
+        private static readonly SolidColorBrush GreenBrush  = CreateFrozenBrush("#22C55E");
+        private static readonly SolidColorBrush AmberBrush  = CreateFrozenBrush("#F59E0B");
+        private static readonly SolidColorBrush BlueBrush   = CreateFrozenBrush("#3B82F6");
+        private static readonly SolidColorBrush RedBrush    = CreateFrozenBrush("#EF4444");
+        private static readonly SolidColorBrush GrayBrush   = CreateFrozenBrush("#94A3B8");
+
+        private static SolidColorBrush CreateFrozenBrush(string hex)
+        {
+            var brush = new SolidColorBrush((Color)ColorConverter.ConvertFromString(hex));
+            brush.Freeze();
+            return brush;
+        }
+
         public object Convert(object value, Type t, object p, CultureInfo c)
         {
             if (value is TransferState state)
                 return state switch
                 {
-                    TransferState.Transferring => "#22C55E",  // green
-                    TransferState.Paused       => "#F59E0B",  // amber
-                    TransferState.Completed    => "#3B82F6",  // blue
-                    TransferState.Failed       => "#EF4444",  // red
-                    TransferState.Cancelled    => "#6B7280",  // gray
-                    _                          => "#6B7280"
+                    TransferState.Transferring => GreenBrush,
+                    TransferState.Paused       => AmberBrush,
+                    TransferState.Completed    => BlueBrush,
+                    TransferState.Failed       => RedBrush,
+                    TransferState.Cancelled    => GrayBrush,
+                    _                          => GrayBrush
                 };
-            return "#6B7280";
+            return GrayBrush;
         }
         public object ConvertBack(object v, Type t, object p, CultureInfo c) =>
             throw new NotImplementedException();
@@ -126,6 +140,7 @@ namespace LanDrop.Converters
         public object ConvertBack(object v, Type t, object p, CultureInfo c) =>
             throw new NotImplementedException();
     }
+
     /// <summary>
     /// Compares an int value to a parameter. Returns true if equal.
     /// Used for tab RadioButton IsChecked binding.
@@ -141,5 +156,19 @@ namespace LanDrop.Converters
                 return target;
             return System.Windows.Data.Binding.DoNothing;
         }
+    }
+
+    /// <summary>
+    /// Converts an int tab index to Visibility based on the converter parameter.
+    /// </summary>
+    public class IntToVisibilityConverter : IValueConverter
+    {
+        public object Convert(object value, Type t, object p, CultureInfo c) =>
+            value is int i && p is string s && int.TryParse(s, out int target) && i == target
+                ? Visibility.Visible
+                : Visibility.Collapsed;
+
+        public object ConvertBack(object value, Type t, object p, CultureInfo c) =>
+            throw new NotImplementedException();
     }
 }

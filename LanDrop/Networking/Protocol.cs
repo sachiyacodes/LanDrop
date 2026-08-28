@@ -23,7 +23,8 @@ namespace LanDrop.Networking
         public const byte FileHeader   = 0x10;   // sender → receiver: FileHeaderMsg JSON
 
         // ── Data ─────────────────────────────────────────────────────────────
-        public const byte DataChunk    = 0x20;   // sender → receiver: raw bytes
+        public const byte DataChunk        = 0x20;   // sender → receiver: raw bytes
+        public const byte CompressedChunk  = 0x21;   // sender → receiver: [4-byte uncompressed len][compressed bytes]
 
         // ── Control ──────────────────────────────────────────────────────────
         public const byte Pause        = 0x30;
@@ -64,13 +65,13 @@ namespace LanDrop.Networking
         int    FileIndex,
         string RelativePath,
         long   SizeBytes,
-        string Sha256Hash
+        string? Sha256Hash = null
     );
 
-    /// <summary>Sent by sender after all chunks for a file.</summary>
-    public record FileDoneMsg(int FileIndex);
+    /// <summary>Sent by sender after streaming all chunks for a file, carrying the computed checksum.</summary>
+    public record FileDoneMsg(int FileIndex, long SizeBytes, string Checksum);
 
-    /// <summary>Sent by receiver after verifying the file hash.</summary>
+    /// <summary>Sent by receiver after verifying the streaming file hash.</summary>
     public record ChecksumAckMsg(int FileIndex, bool HashMatch, string? ActualHash);
 
     /// <summary>Generic error payload.</summary>

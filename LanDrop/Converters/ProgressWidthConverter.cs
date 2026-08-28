@@ -41,6 +41,20 @@ namespace LanDrop.Converters
     }
 
     /// <summary>
+    /// Returns Visibility.Visible only when TransferState == Transferring.
+    /// </summary>
+    public class IsTransferringToVisibilityConverter : IValueConverter
+    {
+        public object Convert(object value, Type t, object p, CultureInfo c) =>
+            value is Models.TransferState s && s == Models.TransferState.Transferring
+                ? System.Windows.Visibility.Visible
+                : System.Windows.Visibility.Collapsed;
+
+        public object ConvertBack(object v, Type t, object p, CultureInfo c) =>
+            throw new NotImplementedException();
+    }
+
+    /// <summary>
     /// Returns Visibility.Visible only when TransferState == Paused.
     /// </summary>
     public class IsPausedToVisibilityConverter : IValueConverter

@@ -5,6 +5,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Net;
+using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
@@ -71,7 +72,11 @@ namespace LanDrop.Networking
         public void Stop()
         {
             _cts?.Cancel();
-            _udp?.Close();
+            try
+            {
+                _udp?.Close();
+            }
+            catch { }
             _logger.LogInformation("Discovery stopped.");
         }
 
@@ -79,21 +84,45 @@ namespace LanDrop.Networking
 
         private async Task BroadcastLoopAsync(CancellationToken ct)
         {
-            var beacon = BuildBeacon();
-            var broadcastEndpoint = new IPEndPoint(IPAddress.Broadcast, _port);
-
             while (!ct.IsCancellationRequested)
             {
                 try
                 {
-                    await _udp!.SendAsync(beacon, beacon.Length, broadcastEndpoint);
+                    var udp = _udp;
+                    if (udp == null) break;
+
+                    var beacon = BuildBeacon();
+                    var broadcastAddresses = GetBroadcastAddresses();
+
+                    foreach (var ip in broadcastAddresses)
+                    {
+                        if (ct.IsCancellationRequested) break;
+                        try
+                        {
+                            var endpoint = new IPEndPoint(ip, _port);
+                            await udp.SendAsync(beacon, beacon.Length, endpoint);
+                        }
+                        catch (Exception ex) when (!ct.IsCancellationRequested)
+                        {
+                            _logger.LogTrace(ex, "Broadcast send failed to {IP}", ip);
+                        }
+                    }
                 }
+                catch (OperationCanceledException) { break; }
+                catch (ObjectDisposedException) { break; }
                 catch (Exception ex) when (!ct.IsCancellationRequested)
                 {
-                    _logger.LogWarning(ex, "Broadcast send failed.");
+                    _logger.LogWarning(ex, "Broadcast loop error.");
                 }
 
-                await Task.Delay(BroadcastIntervalMs, ct).ContinueWith(_ => { });
+                try
+                {
+                    await Task.Delay(BroadcastIntervalMs, ct);
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
             }
         }
 
@@ -103,12 +132,23 @@ namespace LanDrop.Networking
             {
                 try
                 {
-                    var result = await _udp!.ReceiveAsync(ct);
+                    var udp = _udp;
+                    if (udp == null) break;
+
+                    var result = await udp.ReceiveAsync(ct);
                     ProcessBeacon(result.Buffer, result.RemoteEndPoint.Address);
                 }
                 catch (OperationCanceledException) { break; }
+                catch (ObjectDisposedException) { break; }
+                catch (SocketException ex) when (ct.IsCancellationRequested ||
+                                                 ex.SocketErrorCode == SocketError.Interrupted ||
+                                                 ex.SocketErrorCode == SocketError.OperationAborted)
+                {
+                    break;
+                }
                 catch (Exception ex)
                 {
+                    if (ct.IsCancellationRequested) break;
                     _logger.LogWarning(ex, "Discovery receive error.");
                 }
             }
@@ -118,7 +158,15 @@ namespace LanDrop.Networking
         {
             while (!ct.IsCancellationRequested)
             {
-                await Task.Delay(CleanupIntervalMs, ct).ContinueWith(_ => { });
+                try
+                {
+                    await Task.Delay(CleanupIntervalMs, ct);
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+
                 foreach (var kv in _devices)
                 {
                     if (!kv.Value.IsAlive && _devices.TryRemove(kv.Key, out var lost))
@@ -170,7 +218,10 @@ namespace LanDrop.Networking
                     },
                     (_, existing) =>
                     {
-                        existing.LastSeen = DateTime.UtcNow;
+                        existing.DeviceName = payload.DeviceName;
+                        existing.Port       = payload.Port;
+                        existing.AppVersion = payload.Version;
+                        existing.LastSeen   = DateTime.UtcNow;
                         return existing;
                     });
 
@@ -186,13 +237,78 @@ namespace LanDrop.Networking
             }
         }
 
+        private static HashSet<IPAddress> GetBroadcastAddresses()
+        {
+            var broadcastAddresses = new HashSet<IPAddress> { IPAddress.Broadcast };
+
+            try
+            {
+                foreach (var nic in NetworkInterface.GetAllNetworkInterfaces())
+                {
+                    if (nic.OperationalStatus != OperationalStatus.Up) continue;
+                    if (nic.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
+
+                    var ipProps = nic.GetIPProperties();
+                    foreach (var unicast in ipProps.UnicastAddresses)
+                    {
+                        if (unicast.Address.AddressFamily != AddressFamily.InterNetwork) continue;
+
+                        var mask = unicast.IPv4Mask;
+                        if (mask == null || mask.Equals(IPAddress.Any) || mask.Equals(IPAddress.None))
+                            continue;
+
+                        var ipBytes = unicast.Address.GetAddressBytes();
+                        var maskBytes = mask.GetAddressBytes();
+                        if (ipBytes.Length != 4 || maskBytes.Length != 4) continue;
+
+                        var broadcastBytes = new byte[4];
+                        for (int i = 0; i < 4; i++)
+                        {
+                            broadcastBytes[i] = (byte)(ipBytes[i] | (~maskBytes[i]));
+                        }
+
+                        broadcastAddresses.Add(new IPAddress(broadcastBytes));
+                    }
+                }
+            }
+            catch
+            {
+                // Fallback to 255.255.255.255 if network query fails
+            }
+
+            return broadcastAddresses;
+        }
+
         private static bool IsOwnAddress(IPAddress addr)
         {
-            // Compare against all local IPs
-            var host = Dns.GetHostEntry(Dns.GetHostName());
-            foreach (var ip in host.AddressList)
-                if (ip.Equals(addr)) return true;
-            return IPAddress.IsLoopback(addr);
+            if (IPAddress.IsLoopback(addr)) return true;
+
+            try
+            {
+                foreach (var nic in NetworkInterface.GetAllNetworkInterfaces())
+                {
+                    if (nic.OperationalStatus != OperationalStatus.Up) continue;
+
+                    var ipProps = nic.GetIPProperties();
+                    foreach (var unicast in ipProps.UnicastAddresses)
+                    {
+                        if (unicast.Address.Equals(addr))
+                            return true;
+                    }
+                }
+            }
+            catch
+            {
+                try
+                {
+                    var host = Dns.GetHostEntry(Dns.GetHostName());
+                    foreach (var ip in host.AddressList)
+                        if (ip.Equals(addr)) return true;
+                }
+                catch { }
+            }
+
+            return false;
         }
 
         // ── IDisposable ───────────────────────────────────────────────────────

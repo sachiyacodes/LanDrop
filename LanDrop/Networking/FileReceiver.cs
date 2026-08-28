@@ -40,12 +40,14 @@ namespace LanDrop.Networking
         // Events
         public event EventHandler<IncomingTransferEventArgs>?   IncomingTransfer;
         public event Action<TransferProgress>?                   Progress;
-        public event Action<string, bool>?                       TransferCompleted; // (relPath, success)
+        public event Action<string, long, bool>?                 TransferCompleted; // (relPath, sizeBytes, success)
+        public event Action?                                     SessionCompleted;
         public event Action<string>?                             TransferError;
 
         // Pause gate
+        private readonly object _pauseLock = new();
+        private TaskCompletionSource<bool>? _pauseTcs;
         private volatile bool _paused;
-        private readonly SemaphoreSlim _pauseGate = new(1, 1);
 
         public FileReceiver(AppSettings settings, ILogger<FileReceiver> logger)
         {
@@ -70,23 +72,48 @@ namespace LanDrop.Networking
         {
             _cts?.Cancel();
             _listener?.Stop();
+            Resume();
         }
 
         public void Pause()
         {
-            if (!_paused)
+            lock (_pauseLock)
             {
-                _paused = true;
-                _pauseGate.Wait();
+                if (!_paused)
+                {
+                    _paused = true;
+                    _pauseTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                }
             }
         }
 
         public void Resume()
         {
-            if (_paused)
+            lock (_pauseLock)
             {
-                _paused = false;
-                _pauseGate.Release();
+                if (_paused)
+                {
+                    _paused = false;
+                    _pauseTcs?.TrySetResult(true);
+                    _pauseTcs = null;
+                }
+            }
+        }
+
+        private async Task WaitIfPausedAsync(CancellationToken ct)
+        {
+            Task? waitTask = null;
+            lock (_pauseLock)
+            {
+                if (_paused && _pauseTcs != null)
+                {
+                    waitTask = _pauseTcs.Task;
+                }
+            }
+
+            if (waitTask != null)
+            {
+                await waitTask.WaitAsync(ct);
             }
         }
 
@@ -102,8 +129,11 @@ namespace LanDrop.Networking
                     _ = HandleClientAsync(client, ct);
                 }
                 catch (OperationCanceledException) { break; }
+                catch (ObjectDisposedException) { break; }
+                catch (SocketException) when (ct.IsCancellationRequested) { break; }
                 catch (Exception ex)
                 {
+                    if (ct.IsCancellationRequested) break;
                     _logger.LogWarning(ex, "Accept error.");
                 }
             }
@@ -119,6 +149,8 @@ namespace LanDrop.Networking
             tcp.ReceiveBufferSize = _settings.SocketBufferSize;
             tcp.SendBufferSize    = _settings.SocketBufferSize;
             tcp.NoDelay = true;
+
+            string? activeTempPath = null;
 
             using (tcp)
             using (var stream = tcp.GetStream())
@@ -181,110 +213,223 @@ namespace LanDrop.Networking
                     long totalBytes = hello.TotalBytes;
                     long received   = 0;
                     var  speedometer = new Speedometer();
+                    int  chunkSize   = Math.Max(_settings.ChunkSize, 4 * 1024 * 1024);
+                    byte[] chunkBuf  = System.Buffers.ArrayPool<byte>.Shared.Rent(chunkSize);
+                    var  hasher      = new FastHasher();
 
-                    for (int i = 0; i < hello.FileCount; i++)
+                    try
                     {
-                        var (hdrType, hdrPayload) = await stream.ReadFrameAsync(ct);
-                        if (hdrType == MsgType.SessionDone) break;
-                        if (hdrType != MsgType.FileHeader)
+                        for (int i = 0; i < hello.FileCount; i++)
                         {
-                            await SendError(stream, "UNEXPECTED_MSG", "Expected FileHeader.", ct);
-                            return;
-                        }
-
-                        var fileHeader = FrameHelper.FromJson<FileHeaderMsg>(hdrPayload);
-                        _logger.LogInformation("Receiving file [{Idx}] {Name} ({Size} bytes).",
-                            fileHeader.FileIndex, fileHeader.RelativePath, fileHeader.SizeBytes);
-
-                        // Prepare destination path — sanitise relative path
-                        string safePath  = SanitisePath(fileHeader.RelativePath);
-                        string destPath  = Path.Combine(args.SaveDirectory, safePath);
-                        Directory.CreateDirectory(Path.GetDirectoryName(destPath)!);
-
-                        // Write to a temp file first, then rename on success
-                        string tempPath  = destPath + ".landrop_tmp";
-                        bool   success   = false;
-                        string? actualHash = null;
-
-                        using (var sha256 = SHA256.Create())
-                        using (var fs    = new FileStream(tempPath, FileMode.Create, FileAccess.Write,
-                                                          FileShare.None, _settings.ChunkSize, true))
-                        using (var cs    = new CryptoStream(fs, sha256, CryptoStreamMode.Write))
-                        {
-                            long fileBytesReceived = 0;
-
-                            while (fileBytesReceived < fileHeader.SizeBytes)
+                            var (hdrType, hdrPayload) = await stream.ReadFrameAsync(ct);
+                            if (hdrType == MsgType.SessionDone) break;
+                            if (hdrType == MsgType.Cancel)
                             {
-                                // Pause gate
-                                if (_paused)
+                                _logger.LogWarning("Transfer cancelled by sender.");
+                                TransferError?.Invoke("Cancelled by sender.");
+                                return;
+                            }
+                            if (hdrType != MsgType.FileHeader)
+                            {
+                                await SendError(stream, "UNEXPECTED_MSG", "Expected FileHeader.", ct);
+                                return;
+                            }
+
+                            var fileHeader = FrameHelper.FromJson<FileHeaderMsg>(hdrPayload);
+                            _logger.LogInformation("Receiving file [{Idx}] {Name} ({Size} bytes).",
+                                fileHeader.FileIndex, fileHeader.RelativePath, fileHeader.SizeBytes);
+
+                            // Prepare destination path — sanitise relative path
+                            string safePath = SanitisePath(fileHeader.RelativePath);
+                            string destPath = Path.Combine(args.SaveDirectory, safePath);
+                            Directory.CreateDirectory(Path.GetDirectoryName(destPath)!);
+
+                            // Write to a temp file first, then rename on success
+                            string tempPath = destPath + ".landrop_tmp";
+                            activeTempPath = tempPath;
+                            bool   success  = false;
+                            string? actualHash = null;
+                            bool cancelled = false;
+
+                            try
+                            {
+                                hasher.Reset();
+
+                                var fsOptions = new FileStreamOptions
                                 {
-                                    await _pauseGate.WaitAsync(ct);
-                                    _pauseGate.Release();
+                                    Mode = FileMode.Create,
+                                    Access = FileAccess.Write,
+                                    Share = FileShare.None,
+                                    Options = FileOptions.Asynchronous,
+                                    BufferSize = chunkSize
+                                };
+
+                                using (var fs = new FileStream(tempPath, fsOptions))
+                                {
+                                    // Contiguous NVMe SSD cluster pre-allocation
+                                    if (fileHeader.SizeBytes > 0)
+                                    {
+                                        fs.SetLength(fileHeader.SizeBytes);
+                                    }
+
+                                    long fileBytesReceived = 0;
+
+                                    while (fileBytesReceived < fileHeader.SizeBytes)
+                                    {
+                                        // Pause gate
+                                        await WaitIfPausedAsync(ct);
+
+                                        var (chunkType, chunkLen) = await stream.ReadHeaderAsync(ct);
+
+                                        if (chunkType == MsgType.Cancel)
+                                        {
+                                            _logger.LogWarning("Transfer cancelled by sender.");
+                                            TransferError?.Invoke("Cancelled by sender.");
+                                            cancelled = true;
+                                            break;
+                                        }
+
+                                        if (chunkType == MsgType.FileDone)
+                                        {
+                                            _logger.LogWarning("File ended prematurely on sender at {Received}/{Expected} bytes.",
+                                                fileBytesReceived, fileHeader.SizeBytes);
+
+                                            byte[] prematurePayload = chunkLen > 0 ? new byte[chunkLen] : Array.Empty<byte>();
+                                            if (chunkLen > 0)
+                                                await StreamExtensions.ReadExactlyAsync(stream, prematurePayload, 0, chunkLen, ct);
+
+                                            // Send ChecksumAck with failure
+                                            await stream.WriteJsonFrameAsync(MsgType.ChecksumAck,
+                                                new ChecksumAckMsg(i, false, hasher.GetHashHex()), ct);
+
+                                            TransferCompleted?.Invoke(fileHeader.RelativePath, fileHeader.SizeBytes, false);
+                                            cancelled = true;
+                                            break;
+                                        }
+
+                                        if (chunkType != MsgType.DataChunk && chunkType != MsgType.CompressedChunk)
+                                        {
+                                            string errDetail = $"Expected DataChunk or CompressedChunk but got 0x{chunkType:X2} (ASCII '{(chunkType >= 32 && chunkType < 127 ? (char)chunkType : '?')}') with len {chunkLen} at {fileBytesReceived}/{fileHeader.SizeBytes} bytes.";
+                                            _logger.LogError("{Error}", errDetail);
+                                            await SendError(stream, "UNEXPECTED_MSG", errDetail, ct);
+                                            throw new InvalidOperationException(errDetail);
+                                        }
+
+                                        // Read directly into pooled buffer
+                                        if (chunkLen > chunkBuf.Length)
+                                        {
+                                            System.Buffers.ArrayPool<byte>.Shared.Return(chunkBuf);
+                                            chunkBuf = System.Buffers.ArrayPool<byte>.Shared.Rent(chunkLen);
+                                        }
+
+                                        await StreamExtensions.ReadExactlyAsync(stream, chunkBuf, 0, chunkLen, ct);
+
+                                        if (chunkType == MsgType.CompressedChunk)
+                                        {
+                                            int uncompressedLen = System.Buffers.Binary.BinaryPrimitives.ReadInt32BigEndian(chunkBuf.AsSpan(0, 4));
+                                            byte[] decompBuf = System.Buffers.ArrayPool<byte>.Shared.Rent(uncompressedLen);
+                                            try
+                                            {
+                                                FastCompress.Decompress(chunkBuf.AsSpan(4, chunkLen - 4), decompBuf.AsSpan(0, uncompressedLen));
+                                                hasher.Append(decompBuf.AsSpan(0, uncompressedLen));
+                                                await fs.WriteAsync(decompBuf.AsMemory(0, uncompressedLen), ct);
+
+                                                fileBytesReceived += uncompressedLen;
+                                                received          += uncompressedLen;
+                                                speedometer.Add(uncompressedLen);
+                                            }
+                                            finally
+                                            {
+                                                System.Buffers.ArrayPool<byte>.Shared.Return(decompBuf);
+                                            }
+                                        }
+                                        else
+                                        {
+                                            hasher.Append(chunkBuf.AsSpan(0, chunkLen));
+                                            await fs.WriteAsync(chunkBuf.AsMemory(0, chunkLen), ct);
+
+                                            fileBytesReceived += chunkLen;
+                                            received          += chunkLen;
+                                            speedometer.Add(chunkLen);
+                                        }
+
+                                        Progress?.Invoke(new TransferProgress(
+                                            totalBytes, received,
+                                            speedometer.BytesPerSecond,
+                                            i, fileHeader.RelativePath));
+                                    }
+
+                                    if (!cancelled)
+                                    {
+                                        await fs.FlushAsync(ct);
+                                    }
                                 }
 
-                                var (chunkType, chunkData) = await stream.ReadFrameAsync(ct);
+                                if (cancelled)
+                                {
+                                    return;
+                                }
 
-                                if (chunkType == MsgType.Cancel)
+                                actualHash = hasher.GetHashHex();
+
+                                // Consume FileDone message before sending ChecksumAck
+                                var (doneType, donePayload) = await stream.ReadFrameAsync(ct);
+                                if (doneType == MsgType.Cancel)
                                 {
                                     _logger.LogWarning("Transfer cancelled by sender.");
                                     TransferError?.Invoke("Cancelled by sender.");
-                                    File.Delete(tempPath);
                                     return;
                                 }
-
-                                if (chunkType != MsgType.DataChunk)
+                                if (doneType != MsgType.FileDone)
                                 {
-                                    // Could be FileDone if file is empty
-                                    if (chunkType == MsgType.FileDone) break;
-                                    await SendError(stream, "UNEXPECTED_MSG", "Expected DataChunk.", ct);
-                                    return;
+                                    await SendError(stream, "UNEXPECTED_MSG", "Expected FileDone.", ct);
+                                    throw new InvalidOperationException($"Expected FileDone but got 0x{doneType:X2}");
                                 }
 
-                                await cs.WriteAsync(chunkData, 0, chunkData.Length, ct);
-                                fileBytesReceived += chunkData.Length;
-                                received          += chunkData.Length;
-                                speedometer.Add(chunkData.Length);
+                                var doneMsg = FrameHelper.FromJson<FileDoneMsg>(donePayload);
+                                bool hashMatch = string.Equals(actualHash,
+                                    doneMsg.Checksum, StringComparison.OrdinalIgnoreCase);
 
-                                Progress?.Invoke(new TransferProgress(
-                                    totalBytes, received,
-                                    speedometer.BytesPerSecond,
-                                    i, fileHeader.RelativePath));
+                                if (hashMatch)
+                                {
+                                    // Rename temp → final
+                                    if (File.Exists(destPath)) File.Delete(destPath);
+                                    File.Move(tempPath, destPath);
+                                    activeTempPath = null;
+                                    success = true;
+                                    _logger.LogInformation("File saved: {Path} (checksum OK).", destPath);
+                                }
+                                else
+                                {
+                                    if (File.Exists(tempPath)) File.Delete(tempPath);
+                                    activeTempPath = null;
+                                    _logger.LogError("Checksum MISMATCH! Expected {Expected}, got {Actual}.",
+                                        doneMsg.Checksum, actualHash);
+                                }
+
+                                // Send pipelined checksum ack
+                                await stream.WriteJsonFrameAsync(MsgType.ChecksumAck,
+                                    new ChecksumAckMsg(i, hashMatch, actualHash), ct);
+
+                                TransferCompleted?.Invoke(fileHeader.RelativePath, fileHeader.SizeBytes, success);
                             }
-
-                            // Finalise hash
-                            await cs.FlushFinalBlockAsync(ct);
-                            actualHash = BitConverter.ToString(sha256.Hash!).Replace("-", "").ToLowerInvariant();
+                            finally
+                            {
+                                if (activeTempPath != null && File.Exists(activeTempPath))
+                                {
+                                    try { File.Delete(activeTempPath); } catch { }
+                                    activeTempPath = null;
+                                }
+                            }
                         }
-
-                        // Wait for FileDone message if not already seen
-                        // (already consumed above if file was zero-length)
-
-                        bool hashMatch = string.Equals(actualHash,
-                            fileHeader.Sha256Hash, StringComparison.OrdinalIgnoreCase);
-
-                        if (hashMatch)
-                        {
-                            // Rename temp → final
-                            if (File.Exists(destPath)) File.Delete(destPath);
-                            File.Move(tempPath, destPath);
-                            success = true;
-                            _logger.LogInformation("File saved: {Path} (hash OK).", destPath);
-                        }
-                        else
-                        {
-                            File.Delete(tempPath);
-                            _logger.LogError("Hash MISMATCH! Expected {Expected}, got {Actual}.",
-                                fileHeader.Sha256Hash, actualHash);
-                        }
-
-                        // Send checksum ack
-                        await stream.WriteJsonFrameAsync(MsgType.ChecksumAck,
-                            new ChecksumAckMsg(i, hashMatch, actualHash), ct);
-
-                        TransferCompleted?.Invoke(fileHeader.RelativePath, success);
+                    }
+                    finally
+                    {
+                        System.Buffers.ArrayPool<byte>.Shared.Return(chunkBuf);
                     }
 
                     _logger.LogInformation("Session complete from {Remote}.", remote);
+                    SessionCompleted?.Invoke();
                 }
                 catch (OperationCanceledException) { }
                 catch (Exception ex)
@@ -292,6 +437,14 @@ namespace LanDrop.Networking
                     _logger.LogError(ex, "Error handling client {Remote}.", remote);
                     TransferError?.Invoke(ex.Message);
                     try { await SendError(stream, "INTERNAL_ERROR", ex.Message, ct); } catch { }
+                }
+                finally
+                {
+                    if (activeTempPath != null && File.Exists(activeTempPath))
+                    {
+                        try { File.Delete(activeTempPath); } catch { }
+                        activeTempPath = null;
+                    }
                 }
             }
         }

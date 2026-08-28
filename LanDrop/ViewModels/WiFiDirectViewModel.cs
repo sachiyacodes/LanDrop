@@ -1,6 +1,8 @@
-// ViewModels/WiFiDirectViewModel.cs
+using System;
+using System.Linq;
 using System.Threading.Tasks;
 using System.Windows;
+using System.Windows.Media;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using LanDrop.Services;
@@ -10,6 +12,18 @@ namespace LanDrop.ViewModels
 {
     public partial class WiFiDirectViewModel : ObservableObject
     {
+        private static readonly SolidColorBrush GreenBrush = CreateFrozenBrush("#22C55E");
+        private static readonly SolidColorBrush AmberBrush = CreateFrozenBrush("#F59E0B");
+        private static readonly SolidColorBrush RedBrush   = CreateFrozenBrush("#EF4444");
+        private static readonly SolidColorBrush GrayBrush  = CreateFrozenBrush("#7A9090");
+
+        private static SolidColorBrush CreateFrozenBrush(string hex)
+        {
+            var brush = new SolidColorBrush((Color)ColorConverter.ConvertFromString(hex));
+            brush.Freeze();
+            return brush;
+        }
+
         private readonly WiFiDirectService            _svc;
         private readonly ILogger<WiFiDirectViewModel> _log;
 
@@ -24,6 +38,36 @@ namespace LanDrop.ViewModels
         [ObservableProperty] private string  _toggleBtnText  = "Start Hotspot";
         [ObservableProperty] private bool    _isEditingPass  = false;
         [ObservableProperty] private bool    _isEditingSsid  = false;
+        [ObservableProperty] private bool    _showPassword   = false;
+        [ObservableProperty] private bool    _isSupported    = true;
+
+        public string ToggleButtonText => ToggleBtnText;
+        public string StateColor => HotspotState switch
+        {
+            HotspotState.Running => "#22C55E",
+            HotspotState.Starting or HotspotState.Stopping => "#F59E0B",
+            HotspotState.Failed => "#EF4444",
+            _ => "#7A9090"
+        };
+
+        public SolidColorBrush StateBrush => HotspotState switch
+        {
+            HotspotState.Running => GreenBrush,
+            HotspotState.Starting or HotspotState.Stopping => AmberBrush,
+            HotspotState.Failed => RedBrush,
+            _ => GrayBrush
+        };
+
+        partial void OnHotspotStateChanged(HotspotState value)
+        {
+            OnPropertyChanged(nameof(StateColor));
+            OnPropertyChanged(nameof(StateBrush));
+        }
+
+        partial void OnToggleBtnTextChanged(string value)
+        {
+            OnPropertyChanged(nameof(ToggleButtonText));
+        }
 
         public WiFiDirectViewModel(WiFiDirectService svc, ILogger<WiFiDirectViewModel> log)
         {
@@ -32,25 +76,59 @@ namespace LanDrop.ViewModels
             Ssid      = svc.Ssid;
             Password  = svc.Password;
 
-            _svc.StateChanged  += s => Application.Current.Dispatcher.Invoke(() => OnState(s));
-            _svc.IpAssigned    += ip => Application.Current.Dispatcher.Invoke(() =>
+            _svc.StateChanged  += s => Application.Current?.Dispatcher?.Invoke(() => OnState(s));
+            _svc.IpAssigned    += ip => Application.Current?.Dispatcher?.Invoke(() =>
             {
                 HotspotIp  = ip;
                 StatusText = $"Running  ·  IP {ip}  ·  Network: {Ssid}";
             });
-            _svc.ErrorOccurred += m => Application.Current.Dispatcher.Invoke(() =>
+            _svc.ErrorOccurred += m => Application.Current?.Dispatcher?.Invoke(() =>
             {
                 StatusText = m;
                 IsStopped  = true; IsBusy = false; IsRunning = false;
                 ToggleBtnText = "Start Hotspot";
+                OnPropertyChanged(nameof(ToggleButtonText));
+                OnPropertyChanged(nameof(StateColor));
+                OnPropertyChanged(nameof(StateBrush));
             });
+
+            _ = CheckSupportAsync();
+        }
+
+        private async Task CheckSupportAsync()
+        {
+            try
+            {
+                IsSupported = await WiFiDirectService.IsHostedNetworkSupportedAsync();
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning(ex, "Failed to check hosted network support");
+                IsSupported = true;
+            }
         }
 
         [RelayCommand]
         private async Task ToggleHotspotAsync()
         {
+            if (IsBusy) return;
             if (IsRunning) await _svc.StopHotspotAsync();
             else           await _svc.StartHotspotAsync();
+        }
+
+        [RelayCommand] private void ToggleShowPassword() => ShowPassword = !ShowPassword;
+
+        [RelayCommand]
+        private void RegeneratePassword()
+        {
+            if (!IsStopped) return;
+            const string chars = "abcdefghjkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+            var rng = new Random();
+            var pass = new string(Enumerable.Range(0, 10).Select(_ => chars[rng.Next(chars.Length)]).ToArray());
+            Password = pass;
+            _svc.Password = pass;
+            App.Settings.WifiDirectPass = pass;
+            App.SettingsSvc?.Save(App.Settings);
         }
 
         [RelayCommand] private void EditPassword() => IsEditingPass = true;
@@ -63,6 +141,8 @@ namespace LanDrop.ViewModels
             {
                 Password      = val;
                 _svc.Password = val;
+                App.Settings.WifiDirectPass = val;
+                App.SettingsSvc?.Save(App.Settings);
             }
             IsEditingPass = false;
         }
@@ -74,15 +154,25 @@ namespace LanDrop.ViewModels
             {
                 Ssid      = val;
                 _svc.Ssid = val;
+                App.Settings.WifiDirectSsid = val;
+                App.SettingsSvc?.Save(App.Settings);
             }
             IsEditingSsid = false;
         }
 
         [RelayCommand]
-        private void CopyPassword() => System.Windows.Clipboard.SetText(Password);
+        private void CopyPassword()
+        {
+            if (!string.IsNullOrEmpty(Password))
+                System.Windows.Clipboard.SetText(Password);
+        }
 
         [RelayCommand]
-        private void CopySsid() => System.Windows.Clipboard.SetText(Ssid);
+        private void CopySsid()
+        {
+            if (!string.IsNullOrEmpty(Ssid))
+                System.Windows.Clipboard.SetText(Ssid);
+        }
 
         private void OnState(HotspotState s)
         {
@@ -97,6 +187,9 @@ namespace LanDrop.ViewModels
                 HotspotState.Stopping => "Stopping…",
                 _                     => "Start Hotspot"
             };
+            OnPropertyChanged(nameof(ToggleButtonText));
+            OnPropertyChanged(nameof(StateColor));
+            OnPropertyChanged(nameof(StateBrush));
             StatusText = s switch
             {
                 HotspotState.Starting => "Creating hotspot…",
