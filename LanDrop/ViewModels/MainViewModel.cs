@@ -150,6 +150,9 @@ namespace LanDrop.ViewModels
             _receiver.SessionCompleted  += () =>
                 Application.Current?.Dispatcher?.Invoke(() =>
                 {
+                    if (TransferState is TransferState.Failed or TransferState.Cancelled)
+                        return;
+
                     TransferState   = TransferState.Completed;
                     ProgressPercent = 100;
                     StatusMessage   = "Received all files successfully";

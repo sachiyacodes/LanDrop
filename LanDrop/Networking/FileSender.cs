@@ -75,6 +75,7 @@ namespace LanDrop.Networking
 
             await tcp.ConnectAsync(host, port, ct);
             using var stream = tcp.GetStream();
+            Exception? ackFailure = null;
 
             try
             {
@@ -104,10 +105,16 @@ namespace LanDrop.Networking
                             if (msgType == MsgType.ChecksumAck)
                             {
                                 var ack = FrameHelper.FromJson<ChecksumAckMsg>(payload);
+                                if (ack.FileIndex != i)
+                                {
+                                    _logger.LogError("Unexpected checksum ACK index {AckIndex}, expected {ExpectedIndex}.", ack.FileIndex, i);
+                                    throw new InvalidDataException($"Unexpected checksum ACK index {ack.FileIndex}, expected {i}.");
+                                }
+
                                 if (!ack.HashMatch)
                                 {
-                                    _logger.LogError("Checksum MISMATCH on file {Index}!", i);
-                                    throw new InvalidDataException($"Checksum mismatch for file {i}.");
+                                    _logger.LogError("Checksum MISMATCH on file {Index}!", ack.FileIndex);
+                                    throw new InvalidDataException($"Checksum mismatch for file {ack.FileIndex}.");
                                 }
                             }
                             else if (msgType == MsgType.Error)
@@ -121,8 +128,9 @@ namespace LanDrop.Networking
                             }
                         }
                     }
-                    catch (Exception)
+                    catch (Exception ex)
                     {
+                        ackFailure = ex;
                         try { linkedCts.Cancel(); } catch { }
                         throw;
                     }
@@ -232,6 +240,11 @@ namespace LanDrop.Networking
                 {
                     System.Buffers.ArrayPool<byte>.Shared.Return(buffer);
                 }
+            }
+            catch (OperationCanceledException) when (ackFailure is not null && !ct.IsCancellationRequested)
+            {
+                _logger.LogError(ackFailure, "Transfer aborted due to ACK/verification failure.");
+                throw ackFailure;
             }
             catch (OperationCanceledException)
             {

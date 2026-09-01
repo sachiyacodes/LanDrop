@@ -40,6 +40,9 @@ namespace LanDrop.Services
             if (State == HotspotState.Running) return true;
             SetState(HotspotState.Starting);
 
+            Ssid = SanitiseHotspotValue(Ssid, "ssid");
+            Password = SanitiseHotspotValue(Password, "password");
+
             _settings.WifiDirectSsid = Ssid;
             _settings.WifiDirectPass = Password;
             App.SettingsSvc?.Save(_settings);
@@ -72,7 +75,7 @@ namespace LanDrop.Services
             await StopMobileHotspotAsync();
 
             // Also stop netsh legacy hotspot
-            await RunCmd("netsh", "wlan stop hostednetwork");
+            await RunCmd("netsh", "wlan", "stop", "hostednetwork");
 
             HotspotIp = string.Empty;
             SetState(HotspotState.Stopped);
@@ -117,7 +120,7 @@ namespace LanDrop.Services
                     .Replace("__PASS__", Password.Replace("'", "''"));
 
                 await System.IO.File.WriteAllTextAsync(tmp, ps);
-                var r = await RunCmd("powershell", "-ExecutionPolicy Bypass -WindowStyle Hidden -File \"" + tmp + "\"");
+                var r = await RunCmd("powershell", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File", tmp);
 
                 _logger.LogInformation("MobileHotspot PS output: {Out}", r.Out);
                 return r.Out.Contains("SUCCESS");
@@ -166,7 +169,7 @@ namespace LanDrop.Services
                     "Write-Output ('STOP:' + $res.Status.ToString())\r\n";
 
                 await System.IO.File.WriteAllTextAsync(tmp, ps);
-                await RunCmd("powershell", "-ExecutionPolicy Bypass -WindowStyle Hidden -File \"" + tmp + "\"");
+                await RunCmd("powershell", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File", tmp);
             }
             catch (Exception ex)
             {
@@ -187,8 +190,8 @@ namespace LanDrop.Services
 
         private async Task<bool> TryNetshHotspotAsync()
         {
-            await RunCmd("netsh", "wlan set hostednetwork mode=allow ssid=\"" + Ssid + "\" key=\"" + Password + "\"");
-            var r = await RunCmd("netsh", "wlan start hostednetwork");
+            await RunCmd("netsh", "wlan", "set", "hostednetwork", "mode=allow", $"ssid={Ssid}", $"key={Password}");
+            var r = await RunCmd("netsh", "wlan", "start", "hostednetwork");
             return r.Out.Contains("started") || r.Code == 0;
         }
 
@@ -233,7 +236,21 @@ namespace LanDrop.Services
             ErrorOccurred?.Invoke(m);
         }
 
-        internal static async Task<(bool Ok, string Out, string Err, int Code)> RunCmd(string f, string a)
+        private static string SanitiseHotspotValue(string value, string kind)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                throw new ArgumentException($"{kind} is required.", kind);
+
+            foreach (char c in value)
+            {
+                if (char.IsControl(c))
+                    throw new ArgumentException($"{kind} contains invalid control characters.", kind);
+            }
+
+            return value.Trim();
+        }
+
+        internal static async Task<(bool Ok, string Out, string Err, int Code)> RunCmd(string f, params string[] args)
         {
             try
             {
@@ -242,13 +259,14 @@ namespace LanDrop.Services
                     StartInfo = new ProcessStartInfo
                     {
                         FileName               = f,
-                        Arguments              = a,
                         UseShellExecute        = false,
                         RedirectStandardOutput = true,
                         RedirectStandardError  = true,
                         CreateNoWindow         = true
                     }
                 };
+                foreach (var arg in args)
+                    p.StartInfo.ArgumentList.Add(arg);
                 p.Start();
                 string o = await p.StandardOutput.ReadToEndAsync();
                 string e = await p.StandardError.ReadToEndAsync();
