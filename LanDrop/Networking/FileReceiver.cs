@@ -2,6 +2,7 @@
 // TCP listener that accepts incoming LanDrop connections and saves files
 
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
@@ -32,6 +33,15 @@ namespace LanDrop.Networking
     /// </summary>
     public class FileReceiver : IDisposable
     {
+        private const long MaxInboundFileSizeBytes = 512L * 1024 * 1024 * 1024; // 512 GiB hard cap
+        private const int MaxInboundChunkPayloadBytes = 64 * 1024 * 1024; // 64 MiB frame payload cap
+        private static readonly HashSet<string> ReservedWindowsNames = new(StringComparer.OrdinalIgnoreCase)
+        {
+            "CON", "PRN", "AUX", "NUL",
+            "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+            "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"
+        };
+
         private readonly AppSettings _settings;
         private readonly ILogger     _logger;
         private TcpListener?         _listener;
@@ -151,6 +161,14 @@ namespace LanDrop.Networking
             tcp.NoDelay = true;
 
             string? activeTempPath = null;
+            bool transferSessionStarted = false;
+            bool sessionCompletedRaised = false;
+            void CompleteSession()
+            {
+                if (sessionCompletedRaised) return;
+                sessionCompletedRaised = true;
+                SessionCompleted?.Invoke();
+            }
 
             using (tcp)
             using (var stream = tcp.GetStream())
@@ -208,6 +226,7 @@ namespace LanDrop.Networking
 
                     await stream.WriteJsonFrameAsync(MsgType.HelloAck,
                         new HelloAckMsg(true, string.Empty, args.SaveDirectory), ct);
+                    transferSessionStarted = true;
 
                     // ── Receive files ─────────────────────────────────────────
                     long totalBytes = hello.TotalBytes;
@@ -238,6 +257,13 @@ namespace LanDrop.Networking
                             var fileHeader = FrameHelper.FromJson<FileHeaderMsg>(hdrPayload);
                             _logger.LogInformation("Receiving file [{Idx}] {Name} ({Size} bytes).",
                                 fileHeader.FileIndex, fileHeader.RelativePath, fileHeader.SizeBytes);
+
+                            if (fileHeader.SizeBytes < 0 || fileHeader.SizeBytes > MaxInboundFileSizeBytes)
+                            {
+                                string sizeError = $"Rejected file '{fileHeader.RelativePath}': invalid size {fileHeader.SizeBytes} bytes.";
+                                await SendError(stream, "INVALID_FILE_SIZE", sizeError, ct);
+                                throw new InvalidDataException(sizeError);
+                            }
 
                             // Prepare destination path — sanitise relative path
                             string safePath = SanitisePath(fileHeader.RelativePath);
@@ -315,6 +341,14 @@ namespace LanDrop.Networking
                                             throw new InvalidOperationException(errDetail);
                                         }
 
+                                        long remainingFileBytes = fileHeader.SizeBytes - fileBytesReceived;
+                                        if (chunkLen < 0 || chunkLen > MaxInboundChunkPayloadBytes)
+                                        {
+                                            string lenError = $"Invalid chunk length {chunkLen} for '{fileHeader.RelativePath}'.";
+                                            await SendError(stream, "INVALID_CHUNK_LENGTH", lenError, ct);
+                                            throw new InvalidDataException(lenError);
+                                        }
+
                                         // Read directly into pooled buffer
                                         if (chunkLen > chunkBuf.Length)
                                         {
@@ -326,11 +360,32 @@ namespace LanDrop.Networking
 
                                         if (chunkType == MsgType.CompressedChunk)
                                         {
+                                            if (chunkLen < 4)
+                                            {
+                                                const string compressedHeaderErr = "Compressed chunk missing uncompressed length header.";
+                                                await SendError(stream, "INVALID_COMPRESSED_CHUNK", compressedHeaderErr, ct);
+                                                throw new InvalidDataException(compressedHeaderErr);
+                                            }
+
                                             int uncompressedLen = System.Buffers.Binary.BinaryPrimitives.ReadInt32BigEndian(chunkBuf.AsSpan(0, 4));
+                                            int compressedPayloadLen = chunkLen - 4;
+                                            if (uncompressedLen <= 0 || uncompressedLen > remainingFileBytes || compressedPayloadLen <= 0)
+                                            {
+                                                string decompErr = $"Invalid compressed lengths: compressed={compressedPayloadLen}, uncompressed={uncompressedLen}, remaining={remainingFileBytes}.";
+                                                await SendError(stream, "INVALID_COMPRESSED_LENGTH", decompErr, ct);
+                                                throw new InvalidDataException(decompErr);
+                                            }
+
                                             byte[] decompBuf = System.Buffers.ArrayPool<byte>.Shared.Rent(uncompressedLen);
                                             try
                                             {
-                                                FastCompress.Decompress(chunkBuf.AsSpan(4, chunkLen - 4), decompBuf.AsSpan(0, uncompressedLen));
+                                                int actualDecompressed = FastCompress.Decompress(chunkBuf.AsSpan(4, compressedPayloadLen), decompBuf.AsSpan(0, uncompressedLen));
+                                                if (actualDecompressed != uncompressedLen)
+                                                {
+                                                    string mismatchErr = $"Compressed chunk decompressed to {actualDecompressed} bytes, expected {uncompressedLen}.";
+                                                    await SendError(stream, "INVALID_COMPRESSED_LENGTH", mismatchErr, ct);
+                                                    throw new InvalidDataException(mismatchErr);
+                                                }
                                                 hasher.Append(decompBuf.AsSpan(0, uncompressedLen));
                                                 await fs.WriteAsync(decompBuf.AsMemory(0, uncompressedLen), ct);
 
@@ -345,6 +400,13 @@ namespace LanDrop.Networking
                                         }
                                         else
                                         {
+                                            if (chunkLen > remainingFileBytes)
+                                            {
+                                                string overshootErr = $"Chunk length {chunkLen} exceeds remaining file bytes {remainingFileBytes} for '{fileHeader.RelativePath}'.";
+                                                await SendError(stream, "INVALID_CHUNK_LENGTH", overshootErr, ct);
+                                                throw new InvalidDataException(overshootErr);
+                                            }
+
                                             hasher.Append(chunkBuf.AsSpan(0, chunkLen));
                                             await fs.WriteAsync(chunkBuf.AsMemory(0, chunkLen), ct);
 
@@ -359,10 +421,6 @@ namespace LanDrop.Networking
                                             i, fileHeader.RelativePath));
                                     }
 
-                                    if (!cancelled)
-                                    {
-                                        await fs.FlushAsync(ct);
-                                    }
                                 }
 
                                 if (cancelled)
@@ -429,7 +487,6 @@ namespace LanDrop.Networking
                     }
 
                     _logger.LogInformation("Session complete from {Remote}.", remote);
-                    SessionCompleted?.Invoke();
                 }
                 catch (OperationCanceledException) { }
                 catch (Exception ex)
@@ -440,6 +497,9 @@ namespace LanDrop.Networking
                 }
                 finally
                 {
+                    if (transferSessionStarted)
+                        CompleteSession();
+
                     if (activeTempPath != null && File.Exists(activeTempPath))
                     {
                         try { File.Delete(activeTempPath); } catch { }
@@ -471,12 +531,28 @@ namespace LanDrop.Networking
                 if (part is ".." or "." or "") continue;
                 // Remove chars invalid in Windows file names
                 var cleaned = string.Concat(part.Split(Path.GetInvalidFileNameChars()));
-                if (!string.IsNullOrWhiteSpace(cleaned))
-                    safe.Add(cleaned);
+                cleaned = cleaned.Trim().TrimEnd('.', ' ');
+                if (string.IsNullOrWhiteSpace(cleaned))
+                    continue;
+
+                if (IsReservedWindowsPathPart(cleaned))
+                    cleaned = "_" + cleaned;
+
+                safe.Add(cleaned);
             }
             return safe.Count > 0
                 ? Path.Combine(safe.ToArray())
                 : "received_file";
+        }
+
+        private static bool IsReservedWindowsPathPart(string part)
+        {
+            string candidate = part;
+            int dotIndex = candidate.IndexOf('.');
+            if (dotIndex >= 0)
+                candidate = candidate.Substring(0, dotIndex);
+
+            return ReservedWindowsNames.Contains(candidate);
         }
 
         // ── IDisposable ───────────────────────────────────────────────────────

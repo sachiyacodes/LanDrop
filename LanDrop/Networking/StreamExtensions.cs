@@ -27,7 +27,6 @@ namespace LanDrop.Networking
         {
             var frame = FrameHelper.BuildFrame(msgType, payload ?? Array.Empty<byte>());
             await stream.WriteAsync(frame, 0, frame.Length, ct);
-            await stream.FlushAsync(ct);
         }
 
         /// <summary>
@@ -96,7 +95,6 @@ namespace LanDrop.Networking
         {
             var frame = FrameHelper.BuildJsonFrame(msgType, payload);
             await stream.WriteAsync(frame, 0, frame.Length, ct);
-            await stream.FlushAsync(ct);
         }
 
         // ── Read ──────────────────────────────────────────────────────────────
