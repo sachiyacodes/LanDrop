@@ -33,6 +33,7 @@ namespace LanDrop.Networking
     /// </summary>
     public class FileReceiver : IDisposable
     {
+        internal TimeSpan NetworkReadTimeout { get; init; } = TimeSpan.FromSeconds(30);
         private const long MaxInboundFileSizeBytes = 512L * 1024 * 1024 * 1024; // 512 GiB hard cap
         private const int MaxInboundChunkPayloadBytes = 64 * 1024 * 1024; // 64 MiB frame payload cap
         private static readonly HashSet<string> ReservedWindowsNames = new(StringComparer.OrdinalIgnoreCase)
@@ -46,6 +47,8 @@ namespace LanDrop.Networking
         private readonly ILogger     _logger;
         private TcpListener?         _listener;
         private CancellationTokenSource? _cts;
+        private readonly object _sessionLock = new();
+        private CancellationTokenSource? _sessionCts;
 
         // Events
         public event EventHandler<IncomingTransferEventArgs>?   IncomingTransfer;
@@ -82,6 +85,14 @@ namespace LanDrop.Networking
         {
             _cts?.Cancel();
             _listener?.Stop();
+            CancelTransfer();
+            Resume();
+        }
+
+        public void CancelTransfer()
+        {
+            lock (_sessionLock)
+                _sessionCts?.Cancel();
             Resume();
         }
 
@@ -136,7 +147,18 @@ namespace LanDrop.Networking
                 try
                 {
                     var client = await _listener!.AcceptTcpClientAsync(ct);
-                    _ = HandleClientAsync(client, ct);
+                    CancellationTokenSource sessionCts;
+                    lock (_sessionLock)
+                    {
+                        if (_sessionCts != null)
+                        {
+                            client.Dispose();
+                            continue;
+                        }
+                        sessionCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                        _sessionCts = sessionCts;
+                    }
+                    _ = RunSessionAsync(client, sessionCts);
                 }
                 catch (OperationCanceledException) { break; }
                 catch (ObjectDisposedException) { break; }
@@ -150,6 +172,27 @@ namespace LanDrop.Networking
         }
 
         // ── Per-client handler ────────────────────────────────────────────────
+
+        private async Task RunSessionAsync(TcpClient client, CancellationTokenSource sessionCts)
+        {
+            try
+            {
+                await HandleClientAsync(client, sessionCts.Token);
+            }
+            catch (Exception ex)
+            {
+                client.Dispose();
+                _logger.LogWarning(ex, "Receive session failed.");
+            }
+            finally
+            {
+                lock (_sessionLock)
+                {
+                    _sessionCts = null;
+                    sessionCts.Dispose();
+                }
+            }
+        }
 
         private async Task HandleClientAsync(TcpClient tcp, CancellationToken ct)
         {
@@ -176,7 +219,7 @@ namespace LanDrop.Networking
                 try
                 {
                     // ── Handshake ─────────────────────────────────────────────
-                    var (msg1Type, msg1Payload) = await stream.ReadFrameAsync(ct);
+                    var (msg1Type, msg1Payload) = await stream.ReadFrameAsync(ct, NetworkReadTimeout);
                     if (msg1Type != MsgType.Hello)
                     {
                         await SendError(stream, "UNEXPECTED_MSG", "Expected Hello.", ct);
@@ -193,7 +236,7 @@ namespace LanDrop.Networking
                         await stream.WriteJsonFrameAsync(MsgType.PinChallenge,
                             new { required = true }, ct);
 
-                        var (pinType, pinPayload) = await stream.ReadFrameAsync(ct);
+                        var (pinType, pinPayload) = await stream.ReadFrameAsync(ct, NetworkReadTimeout);
                         if (pinType != MsgType.PinResponse)
                         {
                             await SendError(stream, "PIN_REQUIRED", "PIN response expected.", ct);
@@ -232,7 +275,7 @@ namespace LanDrop.Networking
                     long totalBytes = hello.TotalBytes;
                     long received   = 0;
                     var  speedometer = new Speedometer();
-                    int  chunkSize   = Math.Max(_settings.ChunkSize, 4 * 1024 * 1024);
+                    int  chunkSize   = Math.Clamp(_settings.ChunkSize, 64 * 1024, StreamExtensions.MaxChunkSizeBytes);
                     byte[] chunkBuf  = System.Buffers.ArrayPool<byte>.Shared.Rent(chunkSize);
                     var  hasher      = new FastHasher();
 
@@ -240,7 +283,8 @@ namespace LanDrop.Networking
                     {
                         for (int i = 0; i < hello.FileCount; i++)
                         {
-                            var (hdrType, hdrPayload) = await stream.ReadFrameAsync(ct);
+                            // Accepted peers may pause between frames; announced payload reads still have a deadline.
+                            var (hdrType, hdrPayload) = await stream.ReadFrameAsync(ct, payloadTimeout: NetworkReadTimeout);
                             if (hdrType == MsgType.SessionDone) break;
                             if (hdrType == MsgType.Cancel)
                             {
@@ -271,7 +315,7 @@ namespace LanDrop.Networking
                             Directory.CreateDirectory(Path.GetDirectoryName(destPath)!);
 
                             // Write to a temp file first, then rename on success
-                            string tempPath = destPath + ".landrop_tmp";
+                            string tempPath = destPath + "." + Guid.NewGuid().ToString("N") + ".landrop_tmp";
                             activeTempPath = tempPath;
                             bool   success  = false;
                             string? actualHash = null;
@@ -283,7 +327,7 @@ namespace LanDrop.Networking
 
                                 var fsOptions = new FileStreamOptions
                                 {
-                                    Mode = FileMode.Create,
+                                    Mode = FileMode.CreateNew,
                                     Access = FileAccess.Write,
                                     Share = FileShare.None,
                                     Options = FileOptions.Asynchronous,
@@ -322,7 +366,7 @@ namespace LanDrop.Networking
 
                                             byte[] prematurePayload = chunkLen > 0 ? new byte[chunkLen] : Array.Empty<byte>();
                                             if (chunkLen > 0)
-                                                await StreamExtensions.ReadExactlyAsync(stream, prematurePayload, 0, chunkLen, ct);
+                                                await StreamExtensions.ReadExactlyAsync(stream, prematurePayload, 0, chunkLen, ct, NetworkReadTimeout);
 
                                             // Send ChecksumAck with failure
                                             await stream.WriteJsonFrameAsync(MsgType.ChecksumAck,
@@ -356,7 +400,7 @@ namespace LanDrop.Networking
                                             chunkBuf = System.Buffers.ArrayPool<byte>.Shared.Rent(chunkLen);
                                         }
 
-                                        await StreamExtensions.ReadExactlyAsync(stream, chunkBuf, 0, chunkLen, ct);
+                                        await StreamExtensions.ReadExactlyAsync(stream, chunkBuf, 0, chunkLen, ct, NetworkReadTimeout);
 
                                         if (chunkType == MsgType.CompressedChunk)
                                         {
@@ -369,7 +413,8 @@ namespace LanDrop.Networking
 
                                             int uncompressedLen = System.Buffers.Binary.BinaryPrimitives.ReadInt32BigEndian(chunkBuf.AsSpan(0, 4));
                                             int compressedPayloadLen = chunkLen - 4;
-                                            if (uncompressedLen <= 0 || uncompressedLen > remainingFileBytes || compressedPayloadLen <= 0)
+                                            if (uncompressedLen <= 0 || uncompressedLen > StreamExtensions.MaxChunkSizeBytes ||
+                                                uncompressedLen > remainingFileBytes || compressedPayloadLen <= 0)
                                             {
                                                 string decompErr = $"Invalid compressed lengths: compressed={compressedPayloadLen}, uncompressed={uncompressedLen}, remaining={remainingFileBytes}.";
                                                 await SendError(stream, "INVALID_COMPRESSED_LENGTH", decompErr, ct);
@@ -431,7 +476,7 @@ namespace LanDrop.Networking
                                 actualHash = hasher.GetHashHex();
 
                                 // Consume FileDone message before sending ChecksumAck
-                                var (doneType, donePayload) = await stream.ReadFrameAsync(ct);
+                                var (doneType, donePayload) = await stream.ReadFrameAsync(ct, payloadTimeout: NetworkReadTimeout);
                                 if (doneType == MsgType.Cancel)
                                 {
                                     _logger.LogWarning("Transfer cancelled by sender.");
@@ -451,8 +496,7 @@ namespace LanDrop.Networking
                                 if (hashMatch)
                                 {
                                     // Rename temp → final
-                                    if (File.Exists(destPath)) File.Delete(destPath);
-                                    File.Move(tempPath, destPath);
+                                    destPath = MoveToAvailablePath(tempPath, destPath);
                                     activeTempPath = null;
                                     success = true;
                                     _logger.LogInformation("File saved: {Path} (checksum OK).", destPath);
@@ -469,7 +513,8 @@ namespace LanDrop.Networking
                                 await stream.WriteJsonFrameAsync(MsgType.ChecksumAck,
                                     new ChecksumAckMsg(i, hashMatch, actualHash), ct);
 
-                                TransferCompleted?.Invoke(fileHeader.RelativePath, fileHeader.SizeBytes, success);
+                                TransferCompleted?.Invoke(success ? Path.GetRelativePath(args.SaveDirectory, destPath) :
+                                    fileHeader.RelativePath, fileHeader.SizeBytes, success);
                             }
                             finally
                             {
@@ -510,6 +555,24 @@ namespace LanDrop.Networking
         }
 
         // ── Helpers ───────────────────────────────────────────────────────────
+
+        private static string MoveToAvailablePath(string tempPath, string destination)
+        {
+            string candidate = destination;
+            for (int suffix = 1; ; suffix++)
+            {
+                try
+                {
+                    File.Move(tempPath, candidate);
+                    return candidate;
+                }
+                catch (IOException) when (File.Exists(candidate) || Directory.Exists(candidate))
+                {
+                    candidate = Path.Combine(Path.GetDirectoryName(destination)!,
+                        $"{Path.GetFileNameWithoutExtension(destination)} ({suffix}){Path.GetExtension(destination)}");
+                }
+            }
+        }
 
         private static Task SendError(Stream stream, string code, string msg, CancellationToken ct) =>
             stream.WriteJsonFrameAsync(MsgType.Error, new ErrorMsg(code, msg), ct);

@@ -32,6 +32,11 @@ namespace LanDrop.Services
                     var s    = JsonSerializer.Deserialize<AppSettings>(json, _opts);
                     if (s is not null)
                     {
+                        if (string.IsNullOrWhiteSpace(s.WifiDirectPass) || s.WifiDirectPass == "11111111")
+                        {
+                            s.WifiDirectPass = AppSettings.CreateHotspotPassword();
+                            Save(s);
+                        }
                         _logger.LogInformation("Settings loaded from {Path}.", ConfigFile);
                         return s;
                     }

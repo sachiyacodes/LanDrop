@@ -88,7 +88,7 @@ namespace LanDrop.Networking
 
                 long   sent          = 0;
                 var    speedWindow   = new Speedometer();
-                int    chunkSize     = Math.Max(_settings.ChunkSize, 4 * 1024 * 1024);
+                int    chunkSize     = Math.Clamp(_settings.ChunkSize, 64 * 1024, StreamExtensions.MaxChunkSizeBytes);
                 byte[] buffer        = System.Buffers.ArrayPool<byte>.Shared.Rent(chunkSize);
 
                 using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct);

@@ -16,6 +16,8 @@ namespace LanDrop.Networking
     /// </summary>
     public static class StreamExtensions
     {
+        public const int MaxChunkSizeBytes = 4 * 1024 * 1024;
+        private const int MaxControlPayloadBytes = 64 * 1024;
         // ── Write ─────────────────────────────────────────────────────────────
 
         /// <summary>Write a pre-built framed message to the stream.</summary>
@@ -104,16 +106,26 @@ namespace LanDrop.Networking
         /// </summary>
         public static async Task<(byte MsgType, int PayloadLen)> ReadHeaderAsync(
             this Stream stream,
-            CancellationToken ct = default)
+            CancellationToken ct = default,
+            TimeSpan? readTimeout = null)
         {
             byte[] header = ArrayPool<byte>.Shared.Rent(5);
             try
             {
-                await ReadExactlyAsync(stream, header, 0, 5, ct);
+                await ReadExactlyAsync(stream, header, 0, 5, ct, readTimeout);
                 byte msgType = header[0];
                 int payloadLen = BinaryPrimitives.ReadInt32BigEndian(header.AsSpan(1, 4));
 
-                if (payloadLen < 0 || payloadLen > 256 * 1024 * 1024)
+                int maxLength = msgType switch
+                {
+                    MsgType.DataChunk => MaxChunkSizeBytes,
+                    MsgType.CompressedChunk => MaxChunkSizeBytes + 4,
+                    MsgType.PinResponse => 128,
+                    _ => MaxControlPayloadBytes
+                };
+                if (payloadLen < 0 || payloadLen > maxLength ||
+                    (msgType == MsgType.DataChunk && payloadLen == 0) ||
+                    (msgType == MsgType.CompressedChunk && payloadLen <= 4))
                     throw new InvalidDataException($"Invalid payload length: {payloadLen}");
 
                 return (msgType, payloadLen);
@@ -131,12 +143,16 @@ namespace LanDrop.Networking
         /// </summary>
         public static async Task<(byte MsgType, byte[] Payload)> ReadFrameAsync(
             this Stream stream,
-            CancellationToken ct = default)
+            CancellationToken ct = default,
+            TimeSpan? readTimeout = null,
+            TimeSpan? payloadTimeout = null)
         {
-            var (msgType, payloadLen) = await ReadHeaderAsync(stream, ct);
+            var (msgType, payloadLen) = await ReadHeaderAsync(stream, ct, readTimeout);
+            if (msgType is MsgType.DataChunk or MsgType.CompressedChunk)
+                throw new InvalidDataException("Expected a control message, not a data chunk.");
             byte[] payload = payloadLen > 0 ? new byte[payloadLen] : Array.Empty<byte>();
             if (payloadLen > 0)
-                await ReadExactlyAsync(stream, payload, 0, payloadLen, ct);
+                await ReadExactlyAsync(stream, payload, 0, payloadLen, ct, payloadTimeout ?? readTimeout);
 
             return (msgType, payload);
         }
@@ -152,13 +168,24 @@ namespace LanDrop.Networking
             byte[] buffer,
             int offset,
             int count,
-            CancellationToken ct = default)
+            CancellationToken ct = default,
+            TimeSpan? readTimeout = null)
         {
             if (count == 0) return;
             int totalRead = 0;
+            using var readCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            if (readTimeout.HasValue) readCts.CancelAfter(readTimeout.Value);
             while (totalRead < count)
             {
-                int read = await stream.ReadAsync(buffer.AsMemory(offset + totalRead, count - totalRead), ct);
+                int read;
+                try
+                {
+                    read = await stream.ReadAsync(buffer.AsMemory(offset + totalRead, count - totalRead), readCts.Token);
+                }
+                catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+                {
+                    throw new TimeoutException($"Peer did not finish the message within {readTimeout?.TotalSeconds} seconds.");
+                }
                 if (read == 0)
                 {
                     if (totalRead == 0)

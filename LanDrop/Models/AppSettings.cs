@@ -19,6 +19,9 @@ namespace LanDrop.Models
         public bool   MinimizeToTray   { get; set; } = true;
         // WiFi Direct
         public string WifiDirectSsid   { get; set; } = "LanDrop-Direct";
-        public string WifiDirectPass   { get; set; } = "11111111";
+        public string WifiDirectPass   { get; set; } = CreateHotspotPassword();
+
+        public static string CreateHotspotPassword() =>
+            Convert.ToHexString(System.Security.Cryptography.RandomNumberGenerator.GetBytes(12));
     }
 }

@@ -348,6 +348,7 @@ namespace LanDrop.ViewModels
         private void CancelTransfer()
         {
             _transferCts?.Cancel();
+            _receiver.CancelTransfer();
             _sender?.Resume();
             if (_sender == null)
                 _receiver.Resume();

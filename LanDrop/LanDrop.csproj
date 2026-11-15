@@ -32,6 +32,10 @@
   </ItemGroup>
 
   <ItemGroup>
+    <InternalsVisibleTo Include="LanDrop.Checks" />
+  </ItemGroup>
+
+  <ItemGroup>
     <!-- Embed icon as a WPF resource so it also shows in the window title bar -->
     <Resource Include="Resources\LanDrop.ico" />
   </ItemGroup>

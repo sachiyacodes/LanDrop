@@ -6,6 +6,7 @@ using System.Windows.Media;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using LanDrop.Services;
+using LanDrop.Models;
 using Microsoft.Extensions.Logging;
 
 namespace LanDrop.ViewModels
@@ -29,7 +30,7 @@ namespace LanDrop.ViewModels
 
         [ObservableProperty] private HotspotState _hotspotState    = HotspotState.Stopped;
         [ObservableProperty] private string  _ssid           = "LanDrop-Direct";
-        [ObservableProperty] private string  _password       = "11111111";
+        [ObservableProperty] private string  _password       = string.Empty;
         [ObservableProperty] private string  _hotspotIp      = string.Empty;
         [ObservableProperty] private string  _statusText     = "Off — click Start to create a direct connection";
         [ObservableProperty] private bool    _isRunning      = false;
@@ -122,9 +123,7 @@ namespace LanDrop.ViewModels
         private void RegeneratePassword()
         {
             if (!IsStopped) return;
-            const string chars = "abcdefghjkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-            var rng = new Random();
-            var pass = new string(Enumerable.Range(0, 10).Select(_ => chars[rng.Next(chars.Length)]).ToArray());
+            var pass = AppSettings.CreateHotspotPassword();
             Password = pass;
             _svc.Password = pass;
             App.Settings.WifiDirectPass = pass;
