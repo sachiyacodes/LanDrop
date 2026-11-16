@@ -1,4 +1,4 @@
-# LanDrop 2.0 🚀
+# LanDrop 2.0.1 RC1 🚀
 
 **Local file transfer for Windows, built with C# and WPF.**
 
@@ -20,10 +20,10 @@ LanDrop allows you to send anything — from tiny documents to massive 10+ GB ar
 
 ## 🚀 Quick Start
 
-**Release status:** the published v2.0.0 executable predates the receive-safety fixes described here. Build the current source to use these fixes until a new release is published.
+**Release status:** v2.0.1-rc.1 packages the receive-safety fixes on supported .NET 10 LTS. It remains a prerelease until transfer between two physical PCs and WiFi Direct hardware checks pass. The older v2.0.0 executable predates these fixes.
 
-1. Download `LanDrop.exe` from **[Releases](https://github.com/sachiyacodes/LanDrop/releases)**.
-2. Run it on both Windows PCs. Framework-dependent builds require the .NET 8 Desktop Runtime; the source build commands below produce this kind of executable.
+1. Download `LanDrop-2.0.1-rc.1-win-x64.zip` and its SHA-256 checksum from **[Releases](https://github.com/sachiyacodes/LanDrop/releases)**.
+2. Verify the ZIP checksum, extract it, and run `LanDrop.exe` on both Windows PCs. The release is self-contained; no separate .NET installation is required. It is unsigned, so Windows may show an unknown-publisher warning. Framework-dependent source builds require the .NET 10 Desktop Runtime.
 3. Ensure both devices are on the same Wi-Fi / LAN network (or use the built-in **WiFi Direct** hotspot tab).
 4. Drag & drop files or folders $\rightarrow$ Click **Send**!
 
@@ -61,7 +61,7 @@ Throughput and memory use depend on hardware, storage, network, file sizes, and 
 
 ### Prerequisites
 * Windows 10 / 11 (x64)
-* [.NET 8.0 SDK](https://dotnet.microsoft.com/download/dotnet/8.0)
+* [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0)
 
 ### Build Release Binary
 ```powershell
@@ -69,13 +69,14 @@ dotnet restore LanDrop\LanDrop.csproj
 dotnet build LanDrop\LanDrop.csproj -c Release
 ```
 
-### Publish a Framework-Dependent Single-File Executable
+### Publish a Self-Contained Executable
 ```powershell
 dotnet publish LanDrop\LanDrop.csproj `
   -c Release `
   -r win-x64 `
-  --self-contained false `
+  --self-contained true `
   -p:PublishSingleFile=true `
+  -p:IncludeNativeLibrariesForSelfExtract=true `
   -o publish\
 ```
 
@@ -87,7 +88,7 @@ dotnet publish LanDrop\LanDrop.csproj `
 dotnet run --project tests/LanDrop.Checks/LanDrop.Checks.csproj -c Release
 ```
 
-The dependency-free console checks cover frame allocation limits, generated credentials, duplicate filenames, empty files, receive cancellation, decompression bounds, connection limits, idle pause/resume, and handshake/payload timeouts. The Windows Actions workflow builds the application and runs these checks. Two PCs, WiFi Direct, and GUI interactions still require manual hardware testing. Existing released executables do not include later source fixes until a new release is built and published.
+The dependency-free console checks cover frame allocation limits, generated credentials, duplicate filenames, empty files, receive cancellation, decompression bounds, connection limits, idle pause/resume, and handshake/payload timeouts. The Windows Actions workflow builds the application and runs these checks. Two PCs, WiFi Direct, and GUI interactions still require manual hardware testing. The v2.0.1-rc.1 prerelease includes the current source fixes. See [release verification](docs/release-verification.md) for gates and rollback.
 
 ## 🧠 Architecture Overview
 
